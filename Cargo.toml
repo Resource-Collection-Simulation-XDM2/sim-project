@@ -1,0 +1,22 @@
+[package]
+name = "resource_collection_simulation"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.28"
+noise = "0.9"
+rand = "0.9"
+ratatui = "0.29"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
