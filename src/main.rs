@@ -1,3 +1,4 @@
+mod collector;
 mod scout;
 mod world;
 
@@ -5,6 +6,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use world::{Cell, ResourceKind, World, WorldConfig};
 
+use collector::{Collector, CollectorConfig, CollectorWorld};
 use scout::{Scout, ScoutConfig, ScoutMessage};
 
 #[tokio::main]
@@ -117,6 +119,58 @@ async fn main() -> Result<()> {
         println!(
             "  Scout #{}: ticks={} explored={} discoveries={} sent={} dropped={}",
             scout.id, s.ticks, s.cells_explored, s.discoveries_total, s.messages_sent, s.messages_dropped
+        );
+    }
+
+    // --- Collector simulation demo ---
+    let num_collectors: u16 = 3;
+    let collector_ticks: u64 = 3000;
+    let collector_config = CollectorConfig::default();
+    let mut collector_world = CollectorWorld::from_world(&world);
+
+    let mut collectors: Vec<Collector> = (0..num_collectors)
+        .map(|id| Collector::new(id, world.base(), collector_config, world.cell_count()))
+        .collect();
+
+    let collector_start = std::time::Instant::now();
+    for _ in 0..collector_ticks {
+        for collector in &mut collectors {
+            collector.tick(&world, &mut collector_world);
+        }
+    }
+    let collector_elapsed = collector_start.elapsed();
+
+    let base_inventory = collector_world.base_inventory();
+    let total_unloaded = base_inventory.energy + base_inventory.crystals;
+    println!(
+        "\n--- Collector Simulation ({num_collectors} collectors, {collector_ticks} ticks) ---"
+    );
+    println!(
+        "Total time: {:.2}ms ({:.4}ms/tick)",
+        collector_elapsed.as_secs_f64() * 1000.0,
+        collector_elapsed.as_secs_f64() * 1000.0 / collector_ticks as f64
+    );
+    println!(
+        "Base inventory: energy={} crystals={} total_unloaded={} remaining={} ",
+        base_inventory.energy,
+        base_inventory.crystals,
+        total_unloaded,
+        collector_world.total_remaining()
+    );
+
+    for collector in &collectors {
+        let s = &collector.stats;
+        println!(
+            "  Collector #{}: pos=({}, {}) state={:?} ticks={} moves={} replans={} collected={} unloaded={}",
+            collector.id,
+            collector.position.x,
+            collector.position.y,
+            collector.state,
+            s.ticks,
+            s.moves,
+            s.replans,
+            s.collected_units,
+            s.unloaded_units
         );
     }
 
