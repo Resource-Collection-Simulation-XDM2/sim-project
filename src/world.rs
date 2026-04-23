@@ -244,6 +244,7 @@ fn index_to_position(width: usize, idx: usize) -> Position {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
