@@ -1,5 +1,9 @@
 use std::collections::VecDeque;
 
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
+use crate::simulation::Simulation;
 use crate::world::{Cell, Position, ResourceKind, World};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,95 +23,6 @@ pub struct CollectorConfig {
 impl Default for CollectorConfig {
     fn default() -> Self {
         Self { carry_capacity: 16 }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct BaseInventory {
-    pub energy: u64,
-    pub crystals: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ResourceStock {
-    pub kind: ResourceKind,
-    pub position: Position,
-    pub remaining: u16,
-}
-
-#[derive(Debug, Clone)]
-pub struct CollectorWorld {
-    width: usize,
-    stocks: Vec<ResourceStock>,
-    stock_at: Vec<Option<usize>>,
-    base_inventory: BaseInventory,
-}
-
-impl CollectorWorld {
-    pub fn from_world(world: &World) -> Self {
-        let mut stock_at = vec![None; world.cell_count()];
-        let mut stocks = Vec::with_capacity(world.resources().len());
-
-        for node in world.resources() {
-            let stock_idx = stocks.len();
-            let flat = node.position.y * world.width() + node.position.x;
-            stock_at[flat] = Some(stock_idx);
-            stocks.push(ResourceStock {
-                kind: node.kind,
-                position: node.position,
-                remaining: node.quantity,
-            });
-        }
-
-        Self {
-            width: world.width(),
-            stocks,
-            stock_at,
-            base_inventory: BaseInventory::default(),
-        }
-    }
-
-    pub fn base_inventory(&self) -> BaseInventory {
-        self.base_inventory
-    }
-
-    pub fn total_remaining(&self) -> u64 {
-        self.stocks.iter().map(|s| u64::from(s.remaining)).sum()
-    }
-
-    fn stock_index_at(&self, pos: Position) -> Option<usize> {
-        let flat = pos.y * self.width + pos.x;
-        self.stock_at.get(flat).and_then(|v| *v)
-    }
-
-    fn stock_remaining_at(&self, pos: Position) -> u16 {
-        self.stock_index_at(pos)
-            .and_then(|idx| self.stocks.get(idx).map(|s| s.remaining))
-            .unwrap_or(0)
-    }
-
-    fn take_one_at(&mut self, pos: Position) -> Option<ResourceKind> {
-        let idx = self.stock_index_at(pos)?;
-        let stock = self.stocks.get_mut(idx)?;
-        if stock.remaining == 0 {
-            return None;
-        }
-        stock.remaining -= 1;
-        Some(stock.kind)
-    }
-
-    fn unload(&mut self, cargo_kind: ResourceKind, amount: u16) {
-        match cargo_kind {
-            ResourceKind::Energy => self.base_inventory.energy += u64::from(amount),
-            ResourceKind::Crystal => self.base_inventory.crystals += u64::from(amount),
-        }
-    }
-
-    fn live_targets(&self) -> impl Iterator<Item = Position> + '_ {
-        self.stocks
-            .iter()
-            .filter(|stock| stock.remaining > 0)
-            .map(|stock| stock.position)
     }
 }
 
@@ -132,6 +47,9 @@ pub struct Collector {
     path: Vec<Position>,
     path_next: usize,
     pub stats: CollectorStats,
+    // Per-collector RNG so target selection is not deterministic across
+    // collectors — prevents every collector clustering on the same resource.
+    rng: StdRng,
     // Reusable BFS scratch — allocated once, reset before each plan.
     // bfs_prev needs no fill() reset: stale values are never read because
     // we only follow prev[x] for cells marked visited in the current run.
@@ -153,41 +71,47 @@ impl Collector {
             path: Vec::new(),
             path_next: 0,
             stats: CollectorStats::default(),
+            rng: StdRng::seed_from_u64(u64::from(id).wrapping_mul(0x9E3779B97F4A7C15)),
             bfs_visited: vec![false; map_size],
             bfs_prev: vec![0_usize; map_size],
         }
     }
 
-    pub fn tick(&mut self, world: &World, cworld: &mut CollectorWorld) {
+    /// Advance the collector by one simulation tick.
+    ///
+    /// `sim` provides read access to the static world (via `sim.world`) and
+    /// mutable access to resource stocks / base inventory.
+    pub fn tick(&mut self, sim: &mut Simulation) {
         self.stats.ticks += 1;
 
         match self.state {
-            CollectorState::Seeking => self.tick_seeking(world, cworld),
-            CollectorState::Collecting => self.tick_collecting(cworld),
-            CollectorState::Returning => self.tick_returning(world),
-            CollectorState::Unloading => self.tick_unloading(cworld),
+            CollectorState::Seeking => self.tick_seeking(sim),
+            CollectorState::Collecting => self.tick_collecting(sim),
+            CollectorState::Returning => self.tick_returning(sim),
+            CollectorState::Unloading => self.tick_unloading(sim),
             CollectorState::Idle => {}
         }
     }
 
-    fn tick_seeking(&mut self, world: &World, cworld: &CollectorWorld) {
+    fn tick_seeking(&mut self, sim: &mut Simulation) {
         if self.cargo > 0 {
             self.state = CollectorState::Returning;
             return;
         }
 
         let need_new_target = match self.target {
-            Some(target) => cworld.stock_remaining_at(target) == 0,
+            Some(target) => sim.stock_remaining_at(target) == 0,
             None => true,
         };
 
         if need_new_target {
-            self.target = select_nearest_target(self.position, cworld.live_targets());
+            self.target = self.pick_target(sim);
             self.path.clear();
             self.path_next = 0;
         }
 
         let Some(target) = self.target else {
+            // No live targets left anywhere — truly done.
             self.state = CollectorState::Idle;
             return;
         };
@@ -198,11 +122,13 @@ impl Collector {
         }
 
         if self.path_next >= self.path.len() {
-            if self.plan_path(world, self.position, target) {
+            if self.plan_path(&sim.world, self.position, target) {
                 self.stats.replans += 1;
             } else {
+                // Target unreachable — try a different one next tick.
                 self.target = None;
-                self.state = CollectorState::Idle;
+                self.path.clear();
+                self.path_next = 0;
                 return;
             }
         }
@@ -210,7 +136,7 @@ impl Collector {
         self.step_along_path();
     }
 
-    fn tick_collecting(&mut self, cworld: &mut CollectorWorld) {
+    fn tick_collecting(&mut self, sim: &mut Simulation) {
         if self.cargo >= self.config.carry_capacity {
             self.state = CollectorState::Returning;
             self.target = None;
@@ -229,7 +155,7 @@ impl Collector {
             return;
         }
 
-        if let Some(kind) = cworld.take_one_at(target) {
+        if let Some(kind) = sim.try_collect(target) {
             if self.cargo == 0 {
                 self.cargo_kind = Some(kind);
             }
@@ -239,7 +165,7 @@ impl Collector {
             }
         }
 
-        if self.cargo >= self.config.carry_capacity || cworld.stock_remaining_at(target) == 0 {
+        if self.cargo >= self.config.carry_capacity || sim.stock_remaining_at(target) == 0 {
             self.state = CollectorState::Returning;
             self.target = None;
             self.path.clear();
@@ -247,14 +173,14 @@ impl Collector {
         }
     }
 
-    fn tick_returning(&mut self, world: &World) {
+    fn tick_returning(&mut self, sim: &mut Simulation) {
         if self.position == self.base {
             self.state = CollectorState::Unloading;
             return;
         }
 
         if self.path_next >= self.path.len() {
-            if self.plan_path(world, self.position, self.base) {
+            if self.plan_path(&sim.world, self.position, self.base) {
                 self.stats.replans += 1;
             } else {
                 self.state = CollectorState::Idle;
@@ -265,14 +191,14 @@ impl Collector {
         self.step_along_path();
     }
 
-    fn tick_unloading(&mut self, cworld: &mut CollectorWorld) {
+    fn tick_unloading(&mut self, sim: &mut Simulation) {
         if self.cargo == 0 {
             self.state = CollectorState::Seeking;
             return;
         }
 
         if let Some(kind) = self.cargo_kind {
-            cworld.unload(kind, self.cargo);
+            sim.unload(kind, self.cargo);
             self.stats.unloaded_units += u64::from(self.cargo);
         }
 
@@ -379,17 +305,28 @@ impl Collector {
         self.path.reverse();
         true
     }
-}
 
-fn select_nearest_target(
-    from: Position,
-    targets: impl Iterator<Item = Position>,
-) -> Option<Position> {
-    targets.min_by_key(|target| {
-        let dx = target.x.abs_diff(from.x);
-        let dy = target.y.abs_diff(from.y);
-        dx + dy
-    })
+    /// Pick a resource target using Manhattan-distance-biased randomness.
+    ///
+    /// Sorts live targets by distance, then picks uniformly among the nearest
+    /// few.  This prevents every collector from swarming the single closest
+    /// resource while still preferring nearby targets.
+    fn pick_target(&mut self, sim: &Simulation) -> Option<Position> {
+        let mut targets: Vec<Position> = sim.live_targets().collect();
+        if targets.is_empty() {
+            return None;
+        }
+
+        // Sort by Manhattan distance from current position.
+        let px = self.position.x;
+        let py = self.position.y;
+        targets.sort_by_key(|t| t.x.abs_diff(px) + t.y.abs_diff(py));
+
+        // Choose randomly among the 3 closest (or fewer if there aren't 3).
+        let top_n = 3.min(targets.len());
+        let idx = self.rng.random_range(0..top_n);
+        Some(targets[idx])
+    }
 }
 
 
@@ -398,19 +335,22 @@ fn select_nearest_target(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::simulation::Simulation;
     use crate::world::WorldConfig;
 
     #[test]
     fn collector_collects_and_unloads() {
         let world = World::generate(7, WorldConfig::default()).expect("world generation should succeed");
-        let mut cworld = CollectorWorld::from_world(&world);
-        let mut collector = Collector::new(0, world.base(), CollectorConfig::default(), world.cell_count());
+        let base = world.base();
+        let cell_count = world.cell_count();
+        let mut sim = Simulation::new(world);
+        let mut collector = Collector::new(0, base, CollectorConfig::default(), cell_count);
 
         for _ in 0..2500 {
-            collector.tick(&world, &mut cworld);
+            collector.tick(&mut sim);
         }
 
-        let inv = cworld.base_inventory();
+        let inv = sim.base_inventory;
         let unloaded = inv.energy + inv.crystals;
         assert!(unloaded > 0, "collector did not unload any resource");
         assert_eq!(collector.stats.unloaded_units, unloaded);
@@ -419,12 +359,17 @@ mod tests {
     #[test]
     fn collector_never_steps_on_obstacle() {
         let world = World::generate(11, WorldConfig::default()).expect("world generation should succeed");
-        let mut cworld = CollectorWorld::from_world(&world);
-        let mut collector = Collector::new(0, world.base(), CollectorConfig::default(), world.cell_count());
+        let base = world.base();
+        let cell_count = world.cell_count();
+        let mut sim = Simulation::new(world);
+        let mut collector = Collector::new(0, base, CollectorConfig::default(), cell_count);
 
         for _ in 0..1500 {
-            collector.tick(&world, &mut cworld);
-            let cell = world.cell(collector.position).expect("collector position should stay in-bounds");
+            collector.tick(&mut sim);
+            let cell = sim
+                .world
+                .cell(collector.position)
+                .expect("collector position should stay in-bounds");
             assert_eq!(cell, Cell::Walkable);
         }
     }
@@ -432,19 +377,21 @@ mod tests {
     #[test]
     fn collector_replans_on_events_not_every_tick() {
         let world = World::generate(9, WorldConfig::default()).expect("world generation should succeed");
-        let mut cworld = CollectorWorld::from_world(&world);
+        let base = world.base();
+        let cell_count = world.cell_count();
+        let mut sim = Simulation::new(world);
         let mut collector = Collector::new(
             0,
-            world.base(),
+            base,
             CollectorConfig {
                 carry_capacity: 8,
             },
-            world.cell_count(),
+            cell_count,
         );
         let ticks = 2000_u64;
 
         for _ in 0..ticks {
-            collector.tick(&world, &mut cworld);
+            collector.tick(&mut sim);
         }
 
         assert!(
@@ -457,19 +404,21 @@ mod tests {
     #[test]
     fn collector_tick_timing_metrics() {
         let world = World::generate(42, WorldConfig::default()).expect("world generation should succeed");
-        let mut cworld = CollectorWorld::from_world(&world);
+        let base = world.base();
+        let cell_count = world.cell_count();
+        let mut sim = Simulation::new(world);
         let num_collectors = 4_u16;
         let ticks = 1200_u64;
 
         let mut collectors: Vec<Collector> = (0..num_collectors)
-            .map(|id| Collector::new(id, world.base(), CollectorConfig::default(), world.cell_count()))
+            .map(|id| Collector::new(id, base, CollectorConfig::default(), cell_count))
             .collect();
 
         let mut samples_us = Vec::with_capacity(ticks as usize);
         for _ in 0..ticks {
             let start = std::time::Instant::now();
             for collector in &mut collectors {
-                collector.tick(&world, &mut cworld);
+                collector.tick(&mut sim);
             }
             samples_us.push(start.elapsed().as_nanos() as f64 / 1000.0);
         }

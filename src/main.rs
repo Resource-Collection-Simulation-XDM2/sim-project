@@ -1,13 +1,9 @@
-mod collector;
-mod scout;
-mod world;
-
 use anyhow::Result;
+use resource_collection_simulation::collector::{Collector, CollectorConfig};
+use resource_collection_simulation::scout::{Discovery, Scout, ScoutConfig, ScoutMessage};
+use resource_collection_simulation::simulation::Simulation;
+use resource_collection_simulation::world::{Cell, ResourceKind, World, WorldConfig};
 use tokio::sync::mpsc;
-use world::{Cell, ResourceKind, World, WorldConfig};
-
-use collector::{Collector, CollectorConfig, CollectorWorld};
-use scout::{Scout, ScoutConfig, ScoutMessage};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,7 +53,7 @@ async fn main() -> Result<()> {
         .map(|id| {
             Scout::new(
                 id,
-                world.base(),
+                base,
                 &world,
                 scout_config,
                 1000 + id as u64,
@@ -96,8 +92,8 @@ async fn main() -> Result<()> {
         for discovery in &msg.discoveries {
             total_discoveries += 1;
             match discovery {
-                scout::Discovery::Resource { .. } => resource_discoveries += 1,
-                scout::Discovery::Obstacle { .. } => obstacle_discoveries += 1,
+                Discovery::Resource { .. } => resource_discoveries += 1,
+                Discovery::Obstacle { .. } => obstacle_discoveries += 1,
             }
         }
     }
@@ -126,21 +122,22 @@ async fn main() -> Result<()> {
     let num_collectors: u16 = 3;
     let collector_ticks: u64 = 3000;
     let collector_config = CollectorConfig::default();
-    let mut collector_world = CollectorWorld::from_world(&world);
+    let cell_count = world.cell_count();
+    let mut sim = Simulation::new(world);
 
     let mut collectors: Vec<Collector> = (0..num_collectors)
-        .map(|id| Collector::new(id, world.base(), collector_config, world.cell_count()))
+        .map(|id| Collector::new(id, base, collector_config, cell_count))
         .collect();
 
     let collector_start = std::time::Instant::now();
     for _ in 0..collector_ticks {
         for collector in &mut collectors {
-            collector.tick(&world, &mut collector_world);
+            collector.tick(&mut sim);
         }
     }
     let collector_elapsed = collector_start.elapsed();
 
-    let base_inventory = collector_world.base_inventory();
+    let base_inventory = sim.base_inventory;
     let total_unloaded = base_inventory.energy + base_inventory.crystals;
     println!(
         "\n--- Collector Simulation ({num_collectors} collectors, {collector_ticks} ticks) ---"
@@ -155,7 +152,7 @@ async fn main() -> Result<()> {
         base_inventory.energy,
         base_inventory.crystals,
         total_unloaded,
-        collector_world.total_remaining()
+        sim.total_remaining()
     );
 
     for collector in &collectors {
