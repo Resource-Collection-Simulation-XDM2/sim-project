@@ -2,9 +2,23 @@ use std::collections::VecDeque;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use tokio::sync::mpsc;
 
 use crate::simulation::Simulation;
 use crate::world::{Cell, Position, ResourceKind, World};
+
+// ---------------------------------------------------------------------------
+// Messages sent from collectors to the base
+// ---------------------------------------------------------------------------
+
+/// A message sent by a collector when it unloads resources at the base.
+/// The base processes these to update the global inventory.
+#[derive(Debug, Clone)]
+pub struct CollectorMessage {
+    pub collector_id: u16,
+    pub kind: ResourceKind,
+    pub amount: u16,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectorState {
@@ -47,6 +61,8 @@ pub struct Collector {
     path: Vec<Position>,
     path_next: usize,
     pub stats: CollectorStats,
+    // Channel sender to the base for unloading communication.
+    tx: mpsc::Sender<CollectorMessage>,
     // Per-collector RNG so target selection is not deterministic across
     // collectors — prevents every collector clustering on the same resource.
     rng: StdRng,
@@ -58,7 +74,13 @@ pub struct Collector {
 }
 
 impl Collector {
-    pub fn new(id: u16, base: Position, config: CollectorConfig, map_size: usize) -> Self {
+    pub fn new(
+        id: u16,
+        base: Position,
+        config: CollectorConfig,
+        map_size: usize,
+        tx: mpsc::Sender<CollectorMessage>,
+    ) -> Self {
         Self {
             id,
             position: base,
@@ -71,6 +93,7 @@ impl Collector {
             path: Vec::new(),
             path_next: 0,
             stats: CollectorStats::default(),
+            tx,
             rng: StdRng::seed_from_u64(u64::from(id).wrapping_mul(0x9E3779B97F4A7C15)),
             bfs_visited: vec![false; map_size],
             bfs_prev: vec![0_usize; map_size],
@@ -89,7 +112,13 @@ impl Collector {
             CollectorState::Collecting => self.tick_collecting(sim),
             CollectorState::Returning => self.tick_returning(sim),
             CollectorState::Unloading => self.tick_unloading(sim),
-            CollectorState::Idle => {}
+            CollectorState::Idle => {
+                // Scouts may have discovered new resources — wake up if
+                // there are live targets available now.
+                if self.pick_target(sim).is_some() {
+                    self.state = CollectorState::Seeking;
+                }
+            }
         }
     }
 
@@ -191,14 +220,20 @@ impl Collector {
         self.step_along_path();
     }
 
-    fn tick_unloading(&mut self, sim: &mut Simulation) {
+    fn tick_unloading(&mut self, _sim: &mut Simulation) {
         if self.cargo == 0 {
             self.state = CollectorState::Seeking;
             return;
         }
 
         if let Some(kind) = self.cargo_kind {
-            sim.unload(kind, self.cargo);
+            // Send unload message to base — asynchronous, non-blocking.
+            let msg = CollectorMessage {
+                collector_id: self.id,
+                kind,
+                amount: self.cargo,
+            };
+            let _ = self.tx.try_send(msg);
             self.stats.unloaded_units += u64::from(self.cargo);
         }
 
@@ -344,10 +379,15 @@ mod tests {
         let base = world.base();
         let cell_count = world.cell_count();
         let mut sim = Simulation::new(world);
-        let mut collector = Collector::new(0, base, CollectorConfig::default(), cell_count);
+        sim.reveal_all();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut collector = Collector::new(0, base, CollectorConfig::default(), cell_count, tx);
 
         for _ in 0..2500 {
             collector.tick(&mut sim);
+            while let Ok(msg) = rx.try_recv() {
+                sim.unload(msg.kind, msg.amount);
+            }
         }
 
         let inv = sim.base_inventory;
@@ -362,10 +402,15 @@ mod tests {
         let base = world.base();
         let cell_count = world.cell_count();
         let mut sim = Simulation::new(world);
-        let mut collector = Collector::new(0, base, CollectorConfig::default(), cell_count);
+        sim.reveal_all();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut collector = Collector::new(0, base, CollectorConfig::default(), cell_count, tx);
 
         for _ in 0..1500 {
             collector.tick(&mut sim);
+            while let Ok(msg) = rx.try_recv() {
+                sim.unload(msg.kind, msg.amount);
+            }
             let cell = sim
                 .world
                 .cell(collector.position)
@@ -380,6 +425,8 @@ mod tests {
         let base = world.base();
         let cell_count = world.cell_count();
         let mut sim = Simulation::new(world);
+        sim.reveal_all();
+        let (tx, mut rx) = mpsc::channel(16);
         let mut collector = Collector::new(
             0,
             base,
@@ -387,11 +434,15 @@ mod tests {
                 carry_capacity: 8,
             },
             cell_count,
+            tx,
         );
         let ticks = 2000_u64;
 
         for _ in 0..ticks {
             collector.tick(&mut sim);
+            while let Ok(msg) = rx.try_recv() {
+                sim.unload(msg.kind, msg.amount);
+            }
         }
 
         assert!(
@@ -407,18 +458,24 @@ mod tests {
         let base = world.base();
         let cell_count = world.cell_count();
         let mut sim = Simulation::new(world);
+        sim.reveal_all();
+        let (tx, mut rx) = mpsc::channel(64);
         let num_collectors = 4_u16;
         let ticks = 1200_u64;
 
         let mut collectors: Vec<Collector> = (0..num_collectors)
-            .map(|id| Collector::new(id, base, CollectorConfig::default(), cell_count))
+            .map(|id| Collector::new(id, base, CollectorConfig::default(), cell_count, tx.clone()))
             .collect();
+        drop(tx);
 
         let mut samples_us = Vec::with_capacity(ticks as usize);
         for _ in 0..ticks {
             let start = std::time::Instant::now();
             for collector in &mut collectors {
                 collector.tick(&mut sim);
+            }
+            while let Ok(msg) = rx.try_recv() {
+                sim.unload(msg.kind, msg.amount);
             }
             samples_us.push(start.elapsed().as_nanos() as f64 / 1000.0);
         }

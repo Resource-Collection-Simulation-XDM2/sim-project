@@ -27,6 +27,10 @@ pub struct Simulation {
     stocks: Vec<ResourceStock>,
     stock_at: Vec<Option<usize>>,
     pub base_inventory: BaseInventory,
+
+    // Fog-of-war / knowledge tracking.
+    cells_revealed: Vec<bool>,
+    resource_discovered: Vec<bool>,
 }
 
 impl Simulation {
@@ -37,6 +41,8 @@ impl Simulation {
     pub fn new(world: World) -> Self {
         let cell_count = world.cell_count();
         let width = world.width();
+        let height = world.height();
+        let base = world.base();
         let mut stock_at = vec![None; cell_count];
         let mut stocks = Vec::with_capacity(world.resources().len());
 
@@ -51,11 +57,37 @@ impl Simulation {
             });
         }
 
+        // Reveal cells in a small radius around the base so the simulation
+        // doesn't start completely blind.
+        let mut cells_revealed = vec![false; cell_count];
+        let radius: isize = 4;
+        let r2 = radius * radius;
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as isize - base.x as isize;
+                let dy = y as isize - base.y as isize;
+                if dx * dx + dy * dy <= r2 {
+                    cells_revealed[y * width + x] = true;
+                }
+            }
+        }
+
+        let mut resource_discovered = vec![false; stocks.len()];
+        // Resources inside the initial reveal radius are pre-discovered.
+        for (i, stock) in stocks.iter().enumerate() {
+            let idx = stock.position.y * width + stock.position.x;
+            if cells_revealed[idx] {
+                resource_discovered[i] = true;
+            }
+        }
+
         Self {
             world,
             stocks,
             stock_at,
             base_inventory: BaseInventory::default(),
+            cells_revealed,
+            resource_discovered,
         }
     }
 
@@ -94,12 +126,56 @@ impl Simulation {
         }
     }
 
-    /// Iterator over positions of resource stocks that still have units left.
+    /// Iterator over positions of resource stocks that are **discovered** and
+    /// still have units left.
     pub fn live_targets(&self) -> impl Iterator<Item = Position> + '_ {
         self.stocks
             .iter()
-            .filter(|stock| stock.remaining > 0)
-            .map(|stock| stock.position)
+            .enumerate()
+            .filter(|(i, stock)| stock.remaining > 0 && self.resource_discovered[*i])
+            .map(|(_, stock)| stock.position)
+    }
+
+    // ------------------------------------------------------------------
+    // Fog-of-war / discovery
+    // ------------------------------------------------------------------
+
+    /// Record that a scout has observed a resource at `pos`.
+    pub fn mark_resource_discovered(&mut self, pos: Position) {
+        let width = self.world.width();
+        if let Some(stock_idx) = self.stock_index_at(pos) {
+            self.resource_discovered[stock_idx] = true;
+        }
+        // Also reveal surrounding cells.
+        self.reveal_radius(pos, width, 1);
+    }
+
+    /// Record that a scout has observed an obstacle at `pos`.
+    pub fn mark_obstacle_discovered(&mut self, pos: Position) {
+        let width = self.world.width();
+        let idx = pos.y * width + pos.x;
+        if idx < self.cells_revealed.len() {
+            self.cells_revealed[idx] = true;
+        }
+    }
+
+    /// Whether a map cell has been revealed by any scout (or starts revealed).
+    pub fn is_cell_revealed(&self, pos: Position) -> bool {
+        let flat = pos.y * self.world.width() + pos.x;
+        self.cells_revealed.get(flat).copied().unwrap_or(false)
+    }
+
+    /// Whether a resource at `pos` has been discovered.
+    pub fn is_resource_discovered(&self, pos: Position) -> bool {
+        self.stock_index_at(pos)
+            .map(|idx| self.resource_discovered.get(idx).copied().unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// Reveal all cells and resources (for tests / debug).
+    pub fn reveal_all(&mut self) {
+        self.cells_revealed.fill(true);
+        self.resource_discovered.fill(true);
     }
 
     // ------------------------------------------------------------------
@@ -109,5 +185,26 @@ impl Simulation {
     fn stock_index_at(&self, pos: Position) -> Option<usize> {
         let flat = pos.y * self.world.width() + pos.x;
         self.stock_at.get(flat).and_then(|v| *v)
+    }
+
+    fn reveal_radius(&mut self, center: Position, width: usize, radius: isize) {
+        let r2 = radius * radius;
+        let max_idx = self.cells_revealed.len();
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy > r2 {
+                    continue;
+                }
+                let nx = center.x as isize + dx;
+                let ny = center.y as isize + dy;
+                if nx < 0 || ny < 0 {
+                    continue;
+                }
+                let idx = (ny as usize) * width + (nx as usize);
+                if idx < max_idx {
+                    self.cells_revealed[idx] = true;
+                }
+            }
+        }
     }
 }
