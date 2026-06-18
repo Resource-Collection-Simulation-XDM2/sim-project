@@ -17,6 +17,8 @@ pub struct ResourceStock {
     pub kind: ResourceKind,
     pub position: Position,
     pub remaining: u16,
+    /// Original quantity at generation time (for depletion glow).
+    pub initial: u16,
 }
 
 /// Owns the static world map plus the mutable resource / inventory state that
@@ -54,6 +56,7 @@ impl Simulation {
                 kind: node.kind,
                 position: node.position,
                 remaining: node.quantity,
+                initial: node.quantity,
             });
         }
 
@@ -104,6 +107,14 @@ impl Simulation {
             .unwrap_or(0)
     }
 
+    /// Returns `(remaining, initial)` for the resource at `pos`, or `(0, 0)`
+    /// if none exists.  Used for depletion-glow rendering.
+    pub fn stock_info_at(&self, pos: Position) -> (u16, u16) {
+        self.stock_index_at(pos)
+            .and_then(|idx| self.stocks.get(idx).map(|s| (s.remaining, s.initial)))
+            .unwrap_or((0, 0))
+    }
+
     /// Attempt to collect one unit from the resource at `pos`.
     ///
     /// Returns `Some(kind)` on success, or `None` if the position has no
@@ -152,17 +163,21 @@ impl Simulation {
 
     /// Record that a scout has observed an obstacle at `pos`.
     pub fn mark_obstacle_discovered(&mut self, pos: Position) {
-        let width = self.world.width();
-        let idx = pos.y * width + pos.x;
-        if idx < self.cells_revealed.len() {
-            self.cells_revealed[idx] = true;
+        let idx = pos.y.checked_mul(self.world.width())
+            .and_then(|v| v.checked_add(pos.x));
+        if let Some(i) = idx
+            && i < self.cells_revealed.len()
+        {
+            self.cells_revealed[i] = true;
         }
     }
 
     /// Whether a map cell has been revealed by any scout (or starts revealed).
     pub fn is_cell_revealed(&self, pos: Position) -> bool {
-        let flat = pos.y * self.world.width() + pos.x;
-        self.cells_revealed.get(flat).copied().unwrap_or(false)
+        let flat = pos.y.checked_mul(self.world.width())
+            .and_then(|v| v.checked_add(pos.x));
+        flat.and_then(|i| self.cells_revealed.get(i).copied())
+            .unwrap_or(false)
     }
 
     /// Whether a resource at `pos` has been discovered.
@@ -170,6 +185,17 @@ impl Simulation {
         self.stock_index_at(pos)
             .map(|idx| self.resource_discovered.get(idx).copied().unwrap_or(false))
             .unwrap_or(false)
+    }
+
+    /// Reveal a single cell (called when a robot steps on it).
+    pub fn reveal_cell(&mut self, pos: Position) {
+        let idx = pos.y.checked_mul(self.world.width())
+            .and_then(|v| v.checked_add(pos.x));
+        if let Some(i) = idx
+            && i < self.cells_revealed.len()
+        {
+            self.cells_revealed[i] = true;
+        }
     }
 
     /// Reveal all cells and resources (for tests / debug).

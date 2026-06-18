@@ -64,6 +64,10 @@ impl Default for WorldConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// World generation
+// ---------------------------------------------------------------------------
+
 impl World {
     pub fn generate(seed: u64, config: WorldConfig) -> Result<Self> {
         validate_config(config)?;
