@@ -11,6 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
+use crate::collision::{self, OccupancyGrid};
 use crate::collector::{Collector, CollectorConfig, CollectorMessage};
 use crate::map::{MapPreset, VisualTheme};
 use crate::scout::{Discovery, Scout, ScoutConfig, ScoutMessage};
@@ -40,6 +41,7 @@ pub struct App {
     _collector_tx: mpsc::Sender<CollectorMessage>,
     collector_rx: mpsc::Receiver<CollectorMessage>,
     visual_theme: VisualTheme,
+    occupancy: OccupancyGrid,
     tick: u64,
     done: bool,
 }
@@ -55,6 +57,7 @@ impl App {
         let base = world.base();
         let cell_count = world.cell_count();
         let sim = Simulation::new(world);
+        let occupancy = OccupancyGrid::new(&sim.world);
 
         // Scout channel.
         let scout_config = ScoutConfig::default();
@@ -90,6 +93,7 @@ impl App {
             _collector_tx: collector_tx,
             collector_rx,
             visual_theme,
+            occupancy,
             tick: 0,
             done: false,
         })
@@ -153,15 +157,27 @@ impl App {
     fn tick_simulation(&mut self) {
         self.tick += 1;
 
-        // 1. Tick scouts (explore, discover).
-        for scout in &mut self.scouts {
-            scout.tick(&self.sim.world);
-        }
-        // Reveal cells under scouts (they clear fog as they explore).
+        // ── Prepare occupancy grid ──────────────────────────────
+        self.occupancy.clear();
+        // Pre-reserve current positions so robots don't step into
+        // each other's starting cells.
         for scout in &self.scouts {
+            self.occupancy.try_reserve(scout.position);
+        }
+        for collector in &self.collectors {
+            self.occupancy.try_reserve(collector.position);
+        }
+
+        // ── 1. Tick scouts ─────────────────────────────────────
+        for scout in &mut self.scouts {
+            let old = scout.position;
+            self.occupancy.release(old);
+            scout.tick(&self.sim.world);
+            collision::resolve(&mut scout.position, old, &mut self.occupancy, &self.sim.world);
             self.sim.reveal_cell(scout.position);
         }
-        // 2. Drain scout messages → update shared knowledge.
+
+        // ── 2. Drain scout messages ────────────────────────────
         while let Ok(msg) = self.scout_rx.try_recv() {
             for discovery in &msg.discoveries {
                 match discovery {
@@ -175,15 +191,16 @@ impl App {
             }
         }
 
-        // 3. Tick collectors (seek, collect, return, unload).
+        // ── 3. Tick collectors ─────────────────────────────────
         for collector in &mut self.collectors {
+            let old = collector.position;
+            self.occupancy.release(old);
             collector.tick(&mut self.sim);
-        }
-        // Reveal cells under collectors too.
-        for collector in &self.collectors {
+            collision::resolve(&mut collector.position, old, &mut self.occupancy, &self.sim.world);
             self.sim.reveal_cell(collector.position);
         }
-        // 4. Drain collector unload messages → base updates its inventory.
+
+        // ── 4. Drain collector unload messages ─────────────────
         while let Ok(msg) = self.collector_rx.try_recv() {
             self.sim.unload(msg.kind, msg.amount);
         }
