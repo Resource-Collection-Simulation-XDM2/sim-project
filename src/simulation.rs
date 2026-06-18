@@ -1,6 +1,20 @@
 use crate::world::{Position, ResourceKind, World};
 
 // ---------------------------------------------------------------------------
+// Reveal mode — controls what is visible at simulation start
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevealMode {
+    /// Normal fog-of-war — robots must explore.
+    Normal,
+    /// Terrain is visible but resources stay hidden until scouts discover them.
+    TerrainOnly,
+    /// Everything visible — no robots needed.
+    Full,
+}
+
+// ---------------------------------------------------------------------------
 // Shared simulation state: resource stocks + base inventory
 // ---------------------------------------------------------------------------
 
@@ -207,6 +221,20 @@ impl Simulation {
     pub fn reveal_all(&mut self) {
         self.cells_revealed.fill(true);
         self.resource_discovered.fill(true);
+    }
+
+    /// Reveal all terrain cells but NOT resources — scouts still needed.
+    pub fn reveal_terrain(&mut self) {
+        self.cells_revealed.fill(true);
+    }
+
+    /// Apply the given reveal mode.
+    pub fn apply_reveal_mode(&mut self, mode: RevealMode) {
+        match mode {
+            RevealMode::Normal => {}
+            RevealMode::TerrainOnly => self.reveal_terrain(),
+            RevealMode::Full => self.reveal_all(),
+        }
     }
 
     // ------------------------------------------------------------------

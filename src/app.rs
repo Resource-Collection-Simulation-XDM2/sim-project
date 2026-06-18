@@ -17,7 +17,7 @@ use crate::collector::{Collector, CollectorConfig, CollectorMessage};
 use crate::concurrency::{self, SharedOcc, SharedSim};
 use crate::map::{MapPreset, VisualTheme};
 use crate::scout::{Discovery, Scout, ScoutConfig, ScoutMessage};
-use crate::simulation::Simulation;
+use crate::simulation::{RevealMode, Simulation};
 use crate::world::{Cell, Position, World};
 
 const NUM_SCOUTS: u16 = 4;
@@ -39,21 +39,27 @@ pub struct App {
     /// Snapshot of fog-of-war, updated between ticks so rendering never
     /// contends with robot write locks.
     revealed_cache: Vec<bool>,
+    /// Snapshot of inventory + remaining, updated between ticks.
+    cached_energy: u64,
+    cached_crystals: u64,
+    cached_remaining: u64,
     tick: u64,
     done: bool,
 }
 
 impl App {
-    pub fn new(seed: u64, preset: MapPreset, visual_theme: VisualTheme) -> Result<Self> {
+    pub async fn new(seed: u64, preset: MapPreset, visual_theme: VisualTheme, reveal_mode: RevealMode) -> Result<Self> {
         let config = preset.config();
         let world = World::generate(seed, config)?;
         let base = world.base();
         let cell_count = world.cell_count();
         let sim_world_clone = world.clone();
         let sim = Arc::new(RwLock::new(Simulation::new(world)));
+        sim.write().await.apply_reveal_mode(reveal_mode);
         let occupancy = Arc::new(RwLock::new(OccupancyGrid::new(&sim_world_clone)));
 
-        let num_robots = NUM_SCOUTS as usize + NUM_COLLECTORS as usize;
+        let spawn_robots = reveal_mode != RevealMode::Full;
+        let num_robots = if spawn_robots { NUM_SCOUTS as usize + NUM_COLLECTORS as usize } else { 0 };
         let barrier = Arc::new(Barrier::new(num_robots + 1));
 
         let (scout_tx, scout_rx) = mpsc::channel::<ScoutMessage>(CHANNEL_CAPACITY);
@@ -61,24 +67,30 @@ impl App {
         let (position_tx, position_rx) = mpsc::channel::<(u16, Position)>(CHANNEL_CAPACITY);
 
         let scout_config = ScoutConfig::default();
-        for id in 0..NUM_SCOUTS {
-            let scout = Scout::new(id, base, &sim_world_clone, scout_config, 1000 + u64::from(id), scout_tx.clone());
-            tokio::spawn(concurrency::run_scout(
-                scout, sim.clone(), occupancy.clone(), barrier.clone(), position_tx.clone(),
-            ));
+        if spawn_robots {
+            for id in 0..NUM_SCOUTS {
+                let scout = Scout::new(id, base, &sim_world_clone, scout_config, 1000 + u64::from(id), scout_tx.clone());
+                tokio::spawn(concurrency::run_scout(
+                    scout, sim.clone(), occupancy.clone(), barrier.clone(), position_tx.clone(),
+                ));
+            }
         }
 
         let collector_config = CollectorConfig::default();
-        for id in 0..NUM_COLLECTORS {
-            let collector = Collector::new(id + NUM_SCOUTS, base, collector_config, cell_count, collector_tx.clone());
-            tokio::spawn(concurrency::run_collector(
-                collector, sim.clone(), occupancy.clone(), barrier.clone(), position_tx.clone(),
-            ));
+        if spawn_robots {
+            for id in 0..NUM_COLLECTORS {
+                let collector = Collector::new(id + NUM_SCOUTS, base, collector_config, cell_count, collector_tx.clone());
+                tokio::spawn(concurrency::run_collector(
+                    collector, sim.clone(), occupancy.clone(), barrier.clone(), position_tx.clone(),
+                ));
+            }
         }
 
         drop(scout_tx);
         drop(collector_tx);
         drop(position_tx);
+
+        let initial_remaining: u64 = sim_world_clone.resources().iter().map(|n| u64::from(n.quantity)).sum();
 
         Ok(Self {
             sim, sim_world: sim_world_clone, occupancy: occupancy.clone(), visual_theme,
@@ -86,6 +98,9 @@ impl App {
             scout_positions: vec![base; NUM_SCOUTS as usize],
             collector_positions: vec![base; NUM_COLLECTORS as usize],
             revealed_cache: vec![false; cell_count],
+            cached_energy: 0,
+            cached_crystals: 0,
+            cached_remaining: initial_remaining,
             tick: 0, done: false,
         })
     }
@@ -136,8 +151,11 @@ impl App {
                 for pos in self.scout_positions.iter().chain(&self.collector_positions) {
                     sim_guard.reveal_cell(*pos);
                 }
-                // Snapshot fog-of-war for flicker-free rendering.
+                // Snapshot state for flicker-free rendering.
                 self.revealed_cache.copy_from_slice(sim_guard.revealed_bitmap());
+                self.cached_energy = sim_guard.base_inventory.energy;
+                self.cached_crystals = sim_guard.base_inventory.crystals;
+                self.cached_remaining = sim_guard.total_remaining();
             }
 
             self.tick += 1;
@@ -148,8 +166,7 @@ impl App {
             }
 
             {
-                let sim_guard = self.sim.read().await;
-                if sim_guard.total_remaining() == 0 {
+                if self.cached_remaining == 0 {
                     terminal.draw(|f| self.render(f))?;
                     loop {
                         if event::poll(Duration::from_millis(100))? && let Event::Key(_) = event::read()? {
@@ -250,16 +267,13 @@ impl App {
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
-        let (energy, crystals, remaining) = self.sim.try_read()
-            .map(|g| (g.base_inventory.energy, g.base_inventory.crystals, g.total_remaining()))
-            .unwrap_or((0, 0, 0));
-        let done = remaining == 0;
+        let done = self.cached_remaining == 0;
         let text = if done {
-            format!("T:{}  E:{}  C:{}  Left:0   -   DONE!  Press any key to exit ", self.tick, energy, crystals)
+            format!("T:{}  E:{}  C:{}  Left:0  —  DONE!  Press any key", self.tick, self.cached_energy, self.cached_crystals)
         } else {
-            format!("T:{}  E:{}  C:{}  Left:{}   -   running...", self.tick, energy, crystals, remaining)
+            format!("T:{}  E:{}  C:{}  Left:{}  —  running…", self.tick, self.cached_energy, self.cached_crystals, self.cached_remaining)
         };
-        f.render_widget(Paragraph::new(Span::styled(text, Style::default().fg(Color::White))), area);
+        f.render_widget(Paragraph::new(Span::styled(text, Style::default())), area);
     }
 }
 
@@ -305,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn app_simulation_runs_without_panics() {
-        let mut app = App::new(42, MapPreset::Default, VisualTheme::DEFAULT)
+        let mut app = App::new(42, MapPreset::Default, VisualTheme::DEFAULT, RevealMode::Normal).await
             .expect("app create");
         for _ in 0..200 {
             app.barrier.wait().await;
@@ -319,7 +333,7 @@ mod tests {
 
     #[tokio::test]
     async fn app_creates_expected_number_of_robots() {
-        let app = App::new(99, MapPreset::Default, VisualTheme::DEFAULT)
+        let app = App::new(99, MapPreset::Default, VisualTheme::DEFAULT, RevealMode::Normal).await
             .expect("app create");
         assert_eq!(app.scout_positions.len(), NUM_SCOUTS as usize);
         assert_eq!(app.collector_positions.len(), NUM_COLLECTORS as usize);

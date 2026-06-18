@@ -30,23 +30,23 @@ impl MapPreset {
         match self {
             Self::Default => base,
             Self::Cavern => WorldConfig {
-                obstacle_threshold: 0.22,
-                obstacle_frequency: 0.06,
-                ..base
-            },
-            Self::Forest => WorldConfig {
-                obstacle_threshold: 0.42,
-                obstacle_frequency: 0.14,
-                ..base
-            },
-            Self::Archipelago => WorldConfig {
-                obstacle_threshold: 0.18,
+                obstacle_threshold: -0.08,
                 obstacle_frequency: 0.04,
                 ..base
             },
+            Self::Forest => WorldConfig {
+                obstacle_threshold: 0.10,
+                obstacle_frequency: 0.12,
+                ..base
+            },
+            Self::Archipelago => WorldConfig {
+                obstacle_threshold: -0.12,
+                obstacle_frequency: 0.03,
+                ..base
+            },
             Self::Plains => WorldConfig {
-                obstacle_threshold: 0.58,
-                obstacle_frequency: 0.06,
+                obstacle_threshold: 0.35,
+                obstacle_frequency: 0.05,
                 ..base
             },
         }
