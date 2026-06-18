@@ -16,5 +16,5 @@ async fn main() -> Result<()> {
     let seed: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
 
     let mut app = App::new(seed, preset, visual)?;
-    app.run()
+    app.run().await
 }

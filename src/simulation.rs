@@ -180,6 +180,11 @@ impl Simulation {
             .unwrap_or(false)
     }
 
+    /// Return a snapshot of the entire fog-of-war bitmap (for rendering).
+    pub fn revealed_bitmap(&self) -> &[bool] {
+        &self.cells_revealed
+    }
+
     /// Whether a resource at `pos` has been discovered.
     pub fn is_resource_discovered(&self, pos: Position) -> bool {
         self.stock_index_at(pos)
