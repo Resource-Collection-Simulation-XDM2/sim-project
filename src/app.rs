@@ -25,6 +25,10 @@ const NUM_COLLECTORS: u16 = 3;
 const CHANNEL_CAPACITY: usize = 128;
 const FRAME_DURATION: Duration = Duration::from_millis(33);
 
+/// Which type of robot occupies a cell (for O(1) rendering lookup).
+#[derive(Clone, Copy)]
+enum RobotKind { Scout, Collector }
+
 pub struct App {
     sim: SharedSim,
     sim_world: World,
@@ -36,8 +40,8 @@ pub struct App {
     barrier: Arc<Barrier>,
     scout_positions: Vec<Position>,
     collector_positions: Vec<Position>,
-    /// Snapshot of fog-of-war, updated between ticks so rendering never
-    /// contends with robot write locks.
+    /// Per-cell robot occupancy bitmap — O(1) lookup during rendering.
+    robot_at: Vec<Option<RobotKind>>,
     revealed_cache: Vec<bool>,
     /// Snapshot of inventory + remaining, updated between ticks.
     cached_energy: u64,
@@ -98,6 +102,7 @@ impl App {
             scout_positions: vec![base; NUM_SCOUTS as usize],
             collector_positions: vec![base; NUM_COLLECTORS as usize],
             revealed_cache: vec![false; cell_count],
+            robot_at: vec![None; cell_count],
             cached_energy: 0,
             cached_crystals: 0,
             cached_remaining: initial_remaining,
@@ -124,6 +129,12 @@ impl App {
 
             self.barrier.wait().await;
 
+            // Clear old robot positions from bitmap.
+            let old_scout: Vec<Position> = self.scout_positions.to_vec();
+            let old_collector: Vec<Position> = self.collector_positions.to_vec();
+            for p in &old_scout { self.set_robot_at(*p, None); }
+            for p in &old_collector { self.set_robot_at(*p, None); }
+
             while let Ok((id, pos)) = self.position_rx.try_recv() {
                 if id < NUM_SCOUTS {
                     self.scout_positions[id as usize] = pos;
@@ -134,6 +145,12 @@ impl App {
                     }
                 }
             }
+
+            // Rebuild bitmap from updated positions.
+            let new_scout: Vec<Position> = self.scout_positions.to_vec();
+            let new_collector: Vec<Position> = self.collector_positions.to_vec();
+            for p in &new_scout { self.set_robot_at(*p, Some(RobotKind::Scout)); }
+            for p in &new_collector { self.set_robot_at(*p, Some(RobotKind::Collector)); }
 
             {
                 let mut sim_guard = self.sim.write().await;
@@ -212,11 +229,12 @@ impl App {
 
     fn cell_char(&self, pos: Position) -> (&str, Color) {
         let t = &self.visual_theme;
-        if self.scout_positions.contains(&pos) {
-            return (t.scout_char, t.scout_color);
-        }
-        if self.collector_positions.contains(&pos) {
-            return (t.collector_char, t.collector_color);
+        // O(1) bitmap lookup instead of Vec::contains scan.
+        let idx = pos.y * self.sim_world.width() + pos.x;
+        match self.robot_at.get(idx).copied().flatten() {
+            Some(RobotKind::Scout) => return (t.scout_char, t.scout_color),
+            Some(RobotKind::Collector) => return (t.collector_char, t.collector_color),
+            None => {}
         }
         if pos == self.sim_world.base() {
             return (t.base_char, self.base_pulse_color(t.base_color));
@@ -274,6 +292,14 @@ impl App {
             format!("T:{}  E:{}  C:{}  Left:{}  —  running…", self.tick, self.cached_energy, self.cached_crystals, self.cached_remaining)
         };
         f.render_widget(Paragraph::new(Span::styled(text, Style::default())), area);
+    }
+
+    #[inline]
+    fn set_robot_at(&mut self, pos: Position, kind: Option<RobotKind>) {
+        let idx = pos.y * self.sim_world.width() + pos.x;
+        if idx < self.robot_at.len() {
+            self.robot_at[idx] = kind;
+        }
     }
 }
 
