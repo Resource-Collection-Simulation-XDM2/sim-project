@@ -55,9 +55,9 @@ impl Default for WorldConfig {
         Self {
             width: 96,
             height: 40,
-            obstacle_threshold: 0.36,
-            obstacle_frequency: 0.08,
-            base_safety_radius: 2,
+            obstacle_threshold: 0.05,
+            obstacle_frequency: 0.06,
+            base_safety_radius: 5,
             energy_nodes: 14,
             crystal_nodes: 14,
         }
@@ -67,6 +67,27 @@ impl Default for WorldConfig {
 // ---------------------------------------------------------------------------
 // World generation
 // ---------------------------------------------------------------------------
+
+/// Compute multi-octave fractal Brownian motion (fBm) noise.
+///
+/// Sums `octaves` layers of Perlin noise at increasing frequencies, producing
+/// coherent, natural-looking terrain with both large-scale structure and
+/// small-scale detail.
+fn fbm_noise(perlin: &Perlin, x: f64, y: f64, base_freq: f64, octaves: u32) -> f64 {
+    let mut value = 0.0;
+    let mut amplitude = 1.0;
+    let mut frequency = base_freq;
+    let mut max_value = 0.0;
+
+    for _ in 0..octaves {
+        value += amplitude * perlin.get([x * frequency, y * frequency]);
+        max_value += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+
+    value / max_value
+}
 
 impl World {
     pub fn generate(seed: u64, config: WorldConfig) -> Result<Self> {
@@ -85,10 +106,13 @@ impl World {
         for y in 0..config.height {
             for x in 0..config.width {
                 let idx = y * config.width + x;
-                let sample = perlin.get([
-                    x as f64 * config.obstacle_frequency,
-                    y as f64 * config.obstacle_frequency,
-                ]);
+                let sample = fbm_noise(
+                    &perlin,
+                    x as f64,
+                    y as f64,
+                    config.obstacle_frequency,
+                    3, // 3 octaves — good balance of coherence and detail
+                );
                 if sample > config.obstacle_threshold {
                     cells[idx] = Cell::Obstacle;
                 }
@@ -97,11 +121,14 @@ impl World {
 
         carve_base_safety_zone(&mut cells, config.width, config.height, base, config.base_safety_radius);
 
+        // Flood-fill from base to find all reachable walkable cells.
+        let reachable = flood_fill_reachable(&cells, config.width, config.height, base);
+
         let mut candidates: Vec<usize> = cells
             .iter()
             .enumerate()
             .filter_map(|(idx, cell)| {
-                if *cell != Cell::Walkable {
+                if *cell != Cell::Walkable || !reachable[idx] {
                     return None;
                 }
 
@@ -116,16 +143,13 @@ impl World {
 
         candidates.shuffle(&mut rng);
 
-        let required_nodes = config.energy_nodes + config.crystal_nodes;
-        if candidates.len() < required_nodes {
-            bail!(
-                "not enough walkable cells for resource placement: have {}, need {}",
-                candidates.len(),
-                required_nodes
-            );
-        }
+        // Place as many resources as reachable space allows (may be fewer
+        // than requested if the map has isolated pockets).
+        let energy_to_place = config.energy_nodes.min(candidates.len());
+        let crystal_to_place = (config.crystal_nodes)
+            .min(candidates.len().saturating_sub(energy_to_place));
 
-        for _ in 0..config.energy_nodes {
+        for _ in 0..energy_to_place {
             let idx = candidates
                 .pop()
                 .ok_or_else(|| anyhow!("candidate pool unexpectedly exhausted"))?;
@@ -139,7 +163,7 @@ impl World {
             resource_at[idx] = Some(resource_index);
         }
 
-        for _ in 0..config.crystal_nodes {
+        for _ in 0..crystal_to_place {
             let idx = candidates
                 .pop()
                 .ok_or_else(|| anyhow!("candidate pool unexpectedly exhausted"))?;
@@ -245,6 +269,54 @@ fn index_to_position(width: usize, idx: usize) -> Position {
         x: idx % width,
         y: idx / width,
     }
+}
+
+/// BFS flood-fill from `start`, returning a bitmap of all walkable cells
+/// reachable without passing through obstacles.
+fn flood_fill_reachable(cells: &[Cell], width: usize, height: usize, start: Position) -> Vec<bool> {
+    let mut reached = vec![false; cells.len()];
+    let start_idx = start.y * width + start.x;
+    if start_idx >= cells.len() || cells[start_idx] == Cell::Obstacle {
+        return reached;
+    }
+    let mut queue = std::collections::VecDeque::new();
+    reached[start_idx] = true;
+    queue.push_back(start_idx);
+
+    while let Some(cur) = queue.pop_front() {
+        let x = cur % width;
+        let y = cur / width;
+        // Cardinal neighbours.
+        if y > 0 {
+            let n = (y - 1) * width + x;
+            if !reached[n] && cells[n] == Cell::Walkable {
+                reached[n] = true;
+                queue.push_back(n);
+            }
+        }
+        if x + 1 < width {
+            let n = y * width + (x + 1);
+            if !reached[n] && cells[n] == Cell::Walkable {
+                reached[n] = true;
+                queue.push_back(n);
+            }
+        }
+        if y + 1 < height {
+            let n = (y + 1) * width + x;
+            if !reached[n] && cells[n] == Cell::Walkable {
+                reached[n] = true;
+                queue.push_back(n);
+            }
+        }
+        if x > 0 {
+            let n = y * width + (x - 1);
+            if !reached[n] && cells[n] == Cell::Walkable {
+                reached[n] = true;
+                queue.push_back(n);
+            }
+        }
+    }
+    reached
 }
 
 #[cfg(test)]

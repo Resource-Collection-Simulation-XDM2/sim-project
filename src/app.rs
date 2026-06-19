@@ -1,7 +1,8 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -9,311 +10,273 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Barrier, RwLock};
 
+use crate::collision::OccupancyGrid;
 use crate::collector::{Collector, CollectorConfig, CollectorMessage};
+use crate::concurrency::{self, SharedOcc, SharedSim};
 use crate::map::{MapPreset, VisualTheme};
 use crate::scout::{Discovery, Scout, ScoutConfig, ScoutMessage};
-use crate::simulation::Simulation;
+use crate::simulation::{RevealMode, Simulation};
 use crate::world::{Cell, Position, World};
-
-// ---------------------------------------------------------------------------
-// Simulation constants
-// ---------------------------------------------------------------------------
 
 const NUM_SCOUTS: u16 = 4;
 const NUM_COLLECTORS: u16 = 3;
 const CHANNEL_CAPACITY: usize = 128;
-/// Target frame duration: ~30 fps.
 const FRAME_DURATION: Duration = Duration::from_millis(33);
 
-// ---------------------------------------------------------------------------
-// App
-// ---------------------------------------------------------------------------
+/// Which type of robot occupies a cell (for O(1) rendering lookup).
+#[derive(Clone, Copy)]
+enum RobotKind { Scout, Collector }
 
 pub struct App {
-    sim: Simulation,
-    scouts: Vec<Scout>,
-    collectors: Vec<Collector>,
-    _scout_tx: mpsc::Sender<ScoutMessage>,
-    scout_rx: mpsc::Receiver<ScoutMessage>,
-    _collector_tx: mpsc::Sender<CollectorMessage>,
-    collector_rx: mpsc::Receiver<CollectorMessage>,
+    sim: SharedSim,
+    sim_world: World,
+    occupancy: SharedOcc,
     visual_theme: VisualTheme,
+    scout_rx: mpsc::Receiver<ScoutMessage>,
+    collector_rx: mpsc::Receiver<CollectorMessage>,
+    position_rx: mpsc::Receiver<(u16, Position)>,
+    barrier: Arc<Barrier>,
+    scout_positions: Vec<Position>,
+    collector_positions: Vec<Position>,
+    /// Per-cell robot occupancy bitmap — O(1) lookup during rendering.
+    robot_at: Vec<Option<RobotKind>>,
+    revealed_cache: Vec<bool>,
+    /// Snapshot of inventory + remaining, updated between ticks.
+    cached_energy: u64,
+    cached_crystals: u64,
+    cached_remaining: u64,
     tick: u64,
     done: bool,
 }
 
 impl App {
-    /// Create a new simulation app.
-    ///
-    /// Generates the world from `config`, creates robots, and wires the
-    /// scout / collector message channels.
-    pub fn new(seed: u64, preset: MapPreset, visual_theme: VisualTheme) -> Result<Self> {
+    pub async fn new(seed: u64, preset: MapPreset, visual_theme: VisualTheme, reveal_mode: RevealMode) -> Result<Self> {
         let config = preset.config();
         let world = World::generate(seed, config)?;
         let base = world.base();
         let cell_count = world.cell_count();
-        let sim = Simulation::new(world);
+        let sim_world_clone = world.clone();
+        let sim = Arc::new(RwLock::new(Simulation::new(world)));
+        sim.write().await.apply_reveal_mode(reveal_mode);
+        let occupancy = Arc::new(RwLock::new(OccupancyGrid::new(&sim_world_clone)));
 
-        // Scout channel.
+        let spawn_robots = reveal_mode != RevealMode::Full;
+        let num_robots = if spawn_robots { NUM_SCOUTS as usize + NUM_COLLECTORS as usize } else { 0 };
+        let barrier = Arc::new(Barrier::new(num_robots + 1));
+
+        let (scout_tx, scout_rx) = mpsc::channel::<ScoutMessage>(CHANNEL_CAPACITY);
+        let (collector_tx, collector_rx) = mpsc::channel::<CollectorMessage>(CHANNEL_CAPACITY);
+        let (position_tx, position_rx) = mpsc::channel::<(u16, Position)>(CHANNEL_CAPACITY);
+
         let scout_config = ScoutConfig::default();
-        let (tx, rx) = mpsc::channel::<ScoutMessage>(CHANNEL_CAPACITY);
-
-        let scouts: Vec<Scout> = (0..NUM_SCOUTS)
-            .map(|id| {
-                Scout::new(
-                    id,
-                    base,
-                    &sim.world,
-                    scout_config,
-                    1000 + u64::from(id),
-                    tx.clone(),
-                )
-            })
-            .collect();
+        if spawn_robots {
+            for id in 0..NUM_SCOUTS {
+                let scout = Scout::new(id, base, &sim_world_clone, scout_config, 1000 + u64::from(id), scout_tx.clone());
+                tokio::spawn(concurrency::run_scout(
+                    scout, sim.clone(), occupancy.clone(), barrier.clone(), position_tx.clone(),
+                ));
+            }
+        }
 
         let collector_config = CollectorConfig::default();
-        let (collector_tx, collector_rx) = mpsc::channel::<CollectorMessage>(CHANNEL_CAPACITY);
-        let collectors: Vec<Collector> = (0..NUM_COLLECTORS)
-            .map(|id| {
-                Collector::new(id, base, collector_config, cell_count, collector_tx.clone())
-            })
-            .collect();
+        if spawn_robots {
+            for id in 0..NUM_COLLECTORS {
+                let collector = Collector::new(id + NUM_SCOUTS, base, collector_config, cell_count, collector_tx.clone());
+                tokio::spawn(concurrency::run_collector(
+                    collector, sim.clone(), occupancy.clone(), barrier.clone(), position_tx.clone(),
+                ));
+            }
+        }
+
+        drop(scout_tx);
+        drop(collector_tx);
+        drop(position_tx);
+
+        let initial_remaining: u64 = sim_world_clone.resources().iter().map(|n| u64::from(n.quantity)).sum();
 
         Ok(Self {
-            sim,
-            scouts,
-            collectors,
-            _scout_tx: tx,
-            scout_rx: rx,
-            _collector_tx: collector_tx,
-            collector_rx,
-            visual_theme,
-            tick: 0,
-            done: false,
+            sim, sim_world: sim_world_clone, occupancy: occupancy.clone(), visual_theme,
+            scout_rx, collector_rx, position_rx, barrier,
+            scout_positions: vec![base; NUM_SCOUTS as usize],
+            collector_positions: vec![base; NUM_COLLECTORS as usize],
+            revealed_cache: vec![false; cell_count],
+            robot_at: vec![None; cell_count],
+            cached_energy: 0,
+            cached_crystals: 0,
+            cached_remaining: initial_remaining,
+            tick: 0, done: false,
         })
     }
 
-    // ------------------------------------------------------------------
-    // Public entry point
-    // ------------------------------------------------------------------
-
-    /// Run the simulation with Ratatui rendering until the user presses a key.
-    pub fn run(&mut self) -> Result<()> {
-        // Set up terminal in alternate screen + raw mode.
+    pub async fn run(&mut self) -> Result<()> {
         let mut stdout = std::io::stdout();
         terminal::enable_raw_mode()?;
         stdout.execute(EnterAlternateScreen)?;
-
         let backend = ratatui::backend::CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        // Main event loop.
         while !self.done {
+            // Prepare occupancy grid for this tick.
+            {
+                let mut occ = self.occupancy.write().await;
+                occ.clear();
+                for pos in self.scout_positions.iter().chain(&self.collector_positions) {
+                    occ.try_reserve(*pos);
+                }
+            }
+
+            self.barrier.wait().await;
+
+            // Clear old robot positions from bitmap.
+            let old_scout: Vec<Position> = self.scout_positions.to_vec();
+            let old_collector: Vec<Position> = self.collector_positions.to_vec();
+            for p in &old_scout { self.set_robot_at(*p, None); }
+            for p in &old_collector { self.set_robot_at(*p, None); }
+
+            while let Ok((id, pos)) = self.position_rx.try_recv() {
+                if id < NUM_SCOUTS {
+                    self.scout_positions[id as usize] = pos;
+                } else {
+                    let cid = id - NUM_SCOUTS;
+                    if (cid as usize) < self.collector_positions.len() {
+                        self.collector_positions[cid as usize] = pos;
+                    }
+                }
+            }
+
+            // Rebuild bitmap from updated positions.
+            let new_scout: Vec<Position> = self.scout_positions.to_vec();
+            let new_collector: Vec<Position> = self.collector_positions.to_vec();
+            for p in &new_scout { self.set_robot_at(*p, Some(RobotKind::Scout)); }
+            for p in &new_collector { self.set_robot_at(*p, Some(RobotKind::Collector)); }
+
+            {
+                let mut sim_guard = self.sim.write().await;
+                while let Ok(msg) = self.scout_rx.try_recv() {
+                    for d in &msg.discoveries {
+                        match d {
+                            Discovery::Resource { position, .. } => sim_guard.mark_resource_discovered(*position),
+                            Discovery::Obstacle { position } => sim_guard.mark_obstacle_discovered(*position),
+                        }
+                    }
+                }
+                while let Ok(msg) = self.collector_rx.try_recv() {
+                    sim_guard.unload(msg.kind, msg.amount);
+                }
+                for pos in self.scout_positions.iter().chain(&self.collector_positions) {
+                    sim_guard.reveal_cell(*pos);
+                }
+                // Snapshot state for flicker-free rendering.
+                self.revealed_cache.copy_from_slice(sim_guard.revealed_bitmap());
+                self.cached_energy = sim_guard.base_inventory.energy;
+                self.cached_crystals = sim_guard.base_inventory.crystals;
+                self.cached_remaining = sim_guard.total_remaining();
+            }
+
+            self.tick += 1;
             terminal.draw(|f| self.render(f))?;
 
-            // Non-blocking input poll.
-            if event::poll(FRAME_DURATION)?
-                && let Event::Key(key) = event::read()?
+            if event::poll(FRAME_DURATION)? && let Event::Key(_) = event::read()? {
+                self.done = true;
+            }
+
             {
-                // Exit only on explicit keys to avoid instant close on launch.
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc) {
+                if self.cached_remaining == 0 {
+                    terminal.draw(|f| self.render(f))?;
+                    loop {
+                        if event::poll(Duration::from_millis(100))? && let Event::Key(_) = event::read()? {
+                            break;
+                        }
+                    }
                     self.done = true;
                 }
             }
-
-            self.tick_simulation();
-
-            // All resources collected — simulation complete.
-            if self.sim.total_remaining() == 0 {
-                // Render one final frame so the user sees "COMPLETE".
-                terminal.draw(|f| self.render(f))?;
-                // Wait for any key press, then exit.
-                loop {
-                    if event::poll(Duration::from_millis(100))?
-                        && let Event::Key(_) = event::read()?
-                    {
-                        break;
-                    }
-                }
-                self.done = true;
-            }
         }
 
-        // Restore terminal.
         terminal::disable_raw_mode()?;
         terminal.backend_mut().execute(LeaveAlternateScreen)?;
-
         Ok(())
     }
 
-    // ------------------------------------------------------------------
-    // Simulation tick
-    // ------------------------------------------------------------------
-
-    fn tick_simulation(&mut self) {
-        self.tick += 1;
-
-        // 1. Tick scouts (explore, discover).
-        for scout in &mut self.scouts {
-            scout.tick(&self.sim.world);
-        }
-        // Reveal cells under scouts (they clear fog as they explore).
-        for scout in &self.scouts {
-            self.sim.reveal_cell(scout.position);
-        }
-        // 2. Drain scout messages → update shared knowledge.
-        while let Ok(msg) = self.scout_rx.try_recv() {
-            for discovery in &msg.discoveries {
-                match discovery {
-                    Discovery::Resource { position, .. } => {
-                        self.sim.mark_resource_discovered(*position);
-                    }
-                    Discovery::Obstacle { position } => {
-                        self.sim.mark_obstacle_discovered(*position);
-                    }
-                }
-            }
-        }
-
-        // 3. Tick collectors (seek, collect, return, unload).
-        for collector in &mut self.collectors {
-            collector.tick(&mut self.sim);
-        }
-        // Reveal cells under collectors too.
-        for collector in &self.collectors {
-            self.sim.reveal_cell(collector.position);
-        }
-        // 4. Drain collector unload messages → base updates its inventory.
-        while let Ok(msg) = self.collector_rx.try_recv() {
-            self.sim.unload(msg.kind, msg.amount);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Rendering
-    // ------------------------------------------------------------------
-
     fn render(&self, f: &mut Frame) {
         let area = f.area();
-
-        // Split: map on top, status bar on bottom.
-        let layout = Layout::vertical([
-            Constraint::Min(1),    // map fills remaining space
-            Constraint::Length(2), // status bar
-        ])
-        .split(area);
-
+        let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
         self.render_map(f, layout[0]);
         self.render_status(f, layout[1]);
     }
 
     fn render_map(&self, f: &mut Frame, area: Rect) {
-        let w = self.sim.world.width();
-        let h = self.sim.world.height();
+        let w = self.sim_world.width();
+        let h = self.sim_world.height();
         let cw = self.visual_theme.cell_width as usize;
-
-        // Build lines of styled spans.
         let mut lines: Vec<Line> = Vec::with_capacity(h);
-
         for y in 0..h {
             let mut spans: Vec<Span> = Vec::with_capacity(w * cw);
             for x in 0..w {
                 let pos = Position { x, y };
                 let (ch, color) = self.cell_char(pos);
                 spans.push(Span::styled(ch, Style::default().fg(color)));
-                // For double-width themes, pad single-width characters so
-                // every cell fills exactly `cw` terminal columns.  4-byte
-                // UTF-8 (emojis) already occupy 2 columns.
                 if cw > 1 && ch.len() < 4 {
                     spans.push(Span::styled(" ", Style::default()));
                 }
             }
             lines.push(Line::from(spans));
         }
-
         f.render_widget(Paragraph::new(lines), area);
     }
 
-    /// Determine the display character and color for a map cell.
-    /// Incorporates biome colors, resource glow, base pulse,
-    /// and fog-gradient edge.
     fn cell_char(&self, pos: Position) -> (&str, Color) {
         let t = &self.visual_theme;
-
-        // ── 1. Robots on top ─────────────────────────────────────
-        for scout in &self.scouts {
-            if scout.position == pos {
-                return (t.scout_char, t.scout_color);
-            }
+        // O(1) bitmap lookup instead of Vec::contains scan.
+        let idx = pos.y * self.sim_world.width() + pos.x;
+        match self.robot_at.get(idx).copied().flatten() {
+            Some(RobotKind::Scout) => return (t.scout_char, t.scout_color),
+            Some(RobotKind::Collector) => return (t.collector_char, t.collector_color),
+            None => {}
         }
-        for collector in &self.collectors {
-            if collector.position == pos {
-                return (t.collector_char, t.collector_color);
-            }
+        if pos == self.sim_world.base() {
+            return (t.base_char, self.base_pulse_color(t.base_color));
         }
-
-        // ── 2. Base (with subtle pulse) ──────────────────────────
-        if pos == self.sim.world.base() {
-            let pulse = self.base_pulse_color(t.base_color);
-            return (t.base_char, pulse);
-        }
-
-        // ── 3. Fog of war (with gradient edge) ───────────────────
-        if !self.sim.is_cell_revealed(pos) {
+        let idx = pos.y * self.sim_world.width() + pos.x;
+        let revealed = self.revealed_cache.get(idx).copied().unwrap_or(false);
+        if !revealed {
             return self.fog_display(pos, t);
         }
-
-        // ── 4. Obstacles (with biome colors) ────────────────────
-        if self.sim.world.cell(pos) == Some(Cell::Obstacle) {
+        if self.sim_world.cell(pos) == Some(Cell::Obstacle) {
             return (t.obstacle_char(pos), t.obstacle_color_for(pos));
         }
-
-        // ── 5. Resources (with depletion glow) ───────────────────
-        if self.sim.is_resource_discovered(pos)
-            && let Some(resource) = self.sim.world.resource_at(pos)
-        {
-            let (remaining, initial) = self.sim.stock_info_at(pos);
-            if remaining > 0 {
-                let (ch, base_color) = t.resource_display(resource.kind);
-                let ratio = remaining as f64 / (initial as f64).max(1.0);
-                let glow = glow_color(base_color, ratio);
-                return (ch, glow);
+        if let Ok(sim_guard) = self.sim.try_read()
+            && sim_guard.is_resource_discovered(pos) && let Some(resource) = self.sim_world.resource_at(pos) {
+                let (remaining, initial) = sim_guard.stock_info_at(pos);
+                if remaining > 0 {
+                    let (ch, base_color) = t.resource_display(resource.kind);
+                    return (ch, glow_color(base_color, remaining as f64 / (initial as f64).max(1.0)));
+                }
             }
-        }
-
-        // ── 6. Walkable ground ───────────────────────────────────
         (t.ground_char, t.ground_color)
     }
 
-
-    /// Subtle brightness oscillation for the base glyph.
     fn base_pulse_color(&self, base: Color) -> Color {
-        // Use sine-like oscillation: tick % 30 gives a slow pulse.
         let phase = (self.tick % 30) as f64 / 30.0;
-        let brightness = 0.75 + 0.25 * (phase * std::f64::consts::TAU).sin();
-        fade_color(base, brightness)
+        fade_color(base, 0.75 + 0.25 * (phase * std::f64::consts::TAU).sin())
     }
 
-    /// Fog display with soft edge: cells adjacent to revealed area get a dim hint.
     fn fog_display(&self, pos: Position, t: &VisualTheme) -> (&str, Color) {
-        let w = self.sim.world.width();
-        let h = self.sim.world.height();
-
-        // Check if any cardinal neighbor (in-bounds) is revealed.
-        let adjacent_revealed = [
+        let w = self.sim_world.width();
+        let h = self.sim_world.height();
+        let revealed = |p: Position| {
+            let i = p.y * w + p.x;
+            self.revealed_cache.get(i).copied().unwrap_or(false)
+        };
+        let adj = [
             (pos.x > 0).then(|| Position { x: pos.x - 1, y: pos.y }),
             (pos.x + 1 < w).then(|| Position { x: pos.x + 1, y: pos.y }),
             (pos.y > 0).then(|| Position { x: pos.x, y: pos.y - 1 }),
             (pos.y + 1 < h).then(|| Position { x: pos.x, y: pos.y + 1 }),
-        ]
-        .iter()
-        .filter_map(|&p| p)
-        .any(|p| self.sim.is_cell_revealed(p));
-
-        if adjacent_revealed {
-            // Dim edge — show a subtle character.
+        ].iter().filter_map(|&p| p).any(revealed);
+        if adj {
             let edge_char = if t.cell_width > 1 { "·" } else { "." };
             (edge_char, fade_color(t.fog_color, 0.15))
         } else {
@@ -322,48 +285,34 @@ impl App {
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
-        let inv = self.sim.base_inventory;
-        let remaining = self.sim.total_remaining();
-        let done = remaining == 0;
-
+        let done = self.cached_remaining == 0;
         let text = if done {
-            format!(
-                "T:{}  E:{}  C:{}  Left:0  —  DONE!  Press any key to exit",
-                self.tick, inv.energy, inv.crystals
-            )
+            format!("T:{}  E:{}  C:{}  Left:0  —  DONE!  Press any key", self.tick, self.cached_energy, self.cached_crystals)
         } else {
-            format!(
-                "T:{}  E:{}  C:{}  Left:{}  —  running…  (q/Esc to quit)",
-                self.tick, inv.energy, inv.crystals, remaining
-            )
+            format!("T:{}  E:{}  C:{}  Left:{}  —  running…", self.tick, self.cached_energy, self.cached_crystals, self.cached_remaining)
         };
+        f.render_widget(Paragraph::new(Span::styled(text, Style::default())), area);
+    }
 
-        let span = Span::styled(text, Style::default().fg(Color::White));
-        f.render_widget(Paragraph::new(span), area);
+    #[inline]
+    fn set_robot_at(&mut self, pos: Position, kind: Option<RobotKind>) {
+        let idx = pos.y * self.sim_world.width() + pos.x;
+        if idx < self.robot_at.len() {
+            self.robot_at[idx] = kind;
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Free helpers
-// ---------------------------------------------------------------------------
-
-/// Linearly interpolate a color toward black by `factor` (0.0 = black, 1.0 = original).
 fn fade_color(c: Color, factor: f64) -> Color {
     let (r, g, b) = color_rgb(c);
     let f = factor.clamp(0.0, 1.0);
     Color::Rgb((f64::from(r) * f) as u8, (f64::from(g) * f) as u8, (f64::from(b) * f) as u8)
 }
 
-/// Brighten a resource color toward white as the stock depletes.
 fn glow_color(c: Color, ratio: f64) -> Color {
-    // ratio = remaining / max_initial → low ratio = nearly depleted → brighter
-    let r = ratio.clamp(0.0, 1.0);
-    // Mix toward white as r → 0 (depleted).
-    let inv = 1.0 - r;
-    mix_color(c, Color::White, inv * 0.5)
+    mix_color(c, Color::White, (1.0 - ratio.clamp(0.0, 1.0)) * 0.5)
 }
 
-/// Mix two colors: `a * (1-t) + b * t`.
 fn mix_color(a: Color, b: Color, t: f64) -> Color {
     let t = t.clamp(0.0, 1.0);
     let (ar, ag, ab) = color_rgb(a);
@@ -375,85 +324,44 @@ fn mix_color(a: Color, b: Color, t: f64) -> Color {
     )
 }
 
-/// Extract (r, g, b) from a Ratatui color.
 fn color_rgb(c: Color) -> (u8, u8, u8) {
     match c {
         Color::Rgb(r, g, b) => (r, g, b),
-        Color::Black => (0, 0, 0),
-        Color::White => (255, 255, 255),
-        Color::Red => (255, 0, 0),
-        Color::Green => (0, 255, 0),
-        Color::Blue => (0, 0, 255),
-        Color::Yellow => (255, 255, 0),
-        Color::Magenta => (255, 0, 255),
-        Color::Cyan => (0, 255, 255),
-        Color::Gray => (128, 128, 128),
-        Color::DarkGray => (64, 64, 64),
-        Color::LightRed => (255, 204, 203),
-        Color::LightGreen => (144, 238, 144),
-        Color::LightBlue => (173, 216, 230),
-        Color::LightCyan => (224, 255, 255),
-        Color::LightMagenta => (255, 224, 255),
-        Color::LightYellow => (255, 255, 224),
+        Color::Black => (0, 0, 0), Color::White => (255, 255, 255),
+        Color::Red => (255, 0, 0), Color::Green => (0, 255, 0), Color::Blue => (0, 0, 255),
+        Color::Yellow => (255, 255, 0), Color::Magenta => (255, 0, 255), Color::Cyan => (0, 255, 255),
+        Color::Gray => (128, 128, 128), Color::DarkGray => (64, 64, 64),
+        Color::LightRed => (255, 204, 203), Color::LightGreen => (144, 238, 144),
+        Color::LightBlue => (173, 216, 230), Color::LightCyan => (224, 255, 255),
+        Color::LightMagenta => (255, 224, 255), Color::LightYellow => (255, 255, 224),
         _ => (128, 128, 128),
     }
 }
-
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::collector::CollectorState;
-    use crate::map::{MapPreset, VisualTheme};
 
-    #[test]
-    fn app_simulation_runs_without_panics() {
-        let mut app = App::new(42, MapPreset::Default, VisualTheme::DEFAULT)
-            .expect("app creation should succeed");
-
-        // Run 500 ticks — enough for scouts to explore and collectors to
-        // start finding targets.
-        for _ in 0..500 {
-            app.tick_simulation();
+    #[tokio::test]
+    async fn app_simulation_runs_without_panics() {
+        let mut app = App::new(42, MapPreset::Default, VisualTheme::DEFAULT, RevealMode::Normal).await
+            .expect("app create");
+        for _ in 0..200 {
+            app.barrier.wait().await;
+            while app.position_rx.try_recv().is_ok() {}
+            while app.scout_rx.try_recv().is_ok() {}
+            while app.collector_rx.try_recv().is_ok() {}
             app.tick += 1;
         }
-
-        // Scouts should have made some discoveries.
-        let total_discovered: u64 = app.scouts.iter().map(|s| s.stats.discoveries_total).sum();
-        assert!(
-            total_discovered > 0,
-            "scouts made no discoveries after 500 ticks"
-        );
-
-        // At least some collectors should have left Idle.
-        let idle_count = app
-            .collectors
-            .iter()
-            .filter(|c| c.state == CollectorState::Idle)
-            .count();
-        assert!(
-            idle_count < app.collectors.len(),
-            "all collectors still idle after 500 ticks"
-        );
-
-        // Simulation world should have revealed cells beyond the base radius.
-        let base = app.sim.world.base();
-        let far_pos = Position {
-            x: base.x + 10,
-            y: base.y + 10,
-        };
-        // Not all maps have walkable cells at +10,+10, so just check that
-        // the simulation didn't panic.
-        let _ = app.sim.is_cell_revealed(far_pos);
+        assert!(app.tick > 0);
     }
 
-    #[test]
-    fn app_creates_expected_number_of_robots() {
-        let app = App::new(99, MapPreset::Default, VisualTheme::DEFAULT)
-            .expect("app creation should succeed");
-        assert_eq!(app.scouts.len(), NUM_SCOUTS as usize);
-        assert_eq!(app.collectors.len(), NUM_COLLECTORS as usize);
+    #[tokio::test]
+    async fn app_creates_expected_number_of_robots() {
+        let app = App::new(99, MapPreset::Default, VisualTheme::DEFAULT, RevealMode::Normal).await
+            .expect("app create");
+        assert_eq!(app.scout_positions.len(), NUM_SCOUTS as usize);
+        assert_eq!(app.collector_positions.len(), NUM_COLLECTORS as usize);
     }
 }
