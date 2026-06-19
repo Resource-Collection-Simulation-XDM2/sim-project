@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -178,16 +178,24 @@ impl App {
             self.tick += 1;
             terminal.draw(|f| self.render(f))?;
 
-            if event::poll(FRAME_DURATION)? && let Event::Key(_) = event::read()? {
-                self.done = true;
+            if event::poll(FRAME_DURATION)? {
+                if let Event::Key(key) = event::read()? {
+                    if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
+                        self.done = true;
+                    }
+                }
             }
 
             {
                 if self.cached_remaining == 0 {
                     terminal.draw(|f| self.render(f))?;
                     loop {
-                        if event::poll(Duration::from_millis(100))? && let Event::Key(_) = event::read()? {
-                            break;
+                        if event::poll(Duration::from_millis(100))? {
+                            if let Event::Key(key) = event::read()? {
+                                if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
+                                    break;
+                                }
+                            }
                         }
                     }
                     self.done = true;
