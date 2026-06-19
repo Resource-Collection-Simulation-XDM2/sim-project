@@ -12,23 +12,10 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 
 use crate::collector::{Collector, CollectorConfig, CollectorMessage};
+use crate::map::{MapPreset, VisualTheme};
 use crate::scout::{Discovery, Scout, ScoutConfig, ScoutMessage};
 use crate::simulation::Simulation;
-use crate::world::{Cell, Position, ResourceKind, World, WorldConfig};
-
-// ---------------------------------------------------------------------------
-// Color palette (matches the project spec)
-// ---------------------------------------------------------------------------
-
-const OBSTACLE_COLOR: Color = Color::LightCyan;
-const ENERGY_COLOR: Color = Color::Green;
-const CRYSTAL_COLOR: Color = Color::LightMagenta;
-const BASE_COLOR: Color = Color::LightGreen;
-const SCOUT_COLOR: Color = Color::Red;
-const COLLECTOR_COLOR: Color = Color::Magenta;
-const GROUND_COLOR: Color = Color::DarkGray;
-const FOG_COLOR: Color = Color::Black;
-const UI_TEXT_COLOR: Color = Color::White;
+use crate::world::{Cell, Position, World};
 
 // ---------------------------------------------------------------------------
 // Simulation constants
@@ -52,6 +39,7 @@ pub struct App {
     scout_rx: mpsc::Receiver<ScoutMessage>,
     _collector_tx: mpsc::Sender<CollectorMessage>,
     collector_rx: mpsc::Receiver<CollectorMessage>,
+    visual_theme: VisualTheme,
     tick: u64,
     done: bool,
 }
@@ -59,9 +47,11 @@ pub struct App {
 impl App {
     /// Create a new simulation app.
     ///
-    /// Generates the world, creates robots, and wires the scout message channel.
-    pub fn new(seed: u64) -> Result<Self> {
-        let world = World::generate(seed, WorldConfig::default())?;
+    /// Generates the world from `config`, creates robots, and wires the
+    /// scout / collector message channels.
+    pub fn new(seed: u64, preset: MapPreset, visual_theme: VisualTheme) -> Result<Self> {
+        let config = preset.config();
+        let world = World::generate(seed, config)?;
         let base = world.base();
         let cell_count = world.cell_count();
         let sim = Simulation::new(world);
@@ -99,6 +89,7 @@ impl App {
             scout_rx: rx,
             _collector_tx: collector_tx,
             collector_rx,
+            visual_theme,
             tick: 0,
             done: false,
         })
@@ -166,7 +157,10 @@ impl App {
         for scout in &mut self.scouts {
             scout.tick(&self.sim.world);
         }
-
+        // Reveal cells under scouts (they clear fog as they explore).
+        for scout in &self.scouts {
+            self.sim.reveal_cell(scout.position);
+        }
         // 2. Drain scout messages → update shared knowledge.
         while let Ok(msg) = self.scout_rx.try_recv() {
             for discovery in &msg.discoveries {
@@ -185,7 +179,10 @@ impl App {
         for collector in &mut self.collectors {
             collector.tick(&mut self.sim);
         }
-
+        // Reveal cells under collectors too.
+        for collector in &self.collectors {
+            self.sim.reveal_cell(collector.position);
+        }
         // 4. Drain collector unload messages → base updates its inventory.
         while let Ok(msg) = self.collector_rx.try_recv() {
             self.sim.unload(msg.kind, msg.amount);
@@ -213,16 +210,23 @@ impl App {
     fn render_map(&self, f: &mut Frame, area: Rect) {
         let w = self.sim.world.width();
         let h = self.sim.world.height();
+        let cw = self.visual_theme.cell_width as usize;
 
         // Build lines of styled spans.
         let mut lines: Vec<Line> = Vec::with_capacity(h);
 
         for y in 0..h {
-            let mut spans: Vec<Span> = Vec::with_capacity(w);
+            let mut spans: Vec<Span> = Vec::with_capacity(w * cw);
             for x in 0..w {
                 let pos = Position { x, y };
                 let (ch, color) = self.cell_char(pos);
                 spans.push(Span::styled(ch, Style::default().fg(color)));
+                // For double-width themes, pad single-width characters so
+                // every cell fills exactly `cw` terminal columns.  4-byte
+                // UTF-8 (emojis) already occupy 2 columns.
+                if cw > 1 && ch.len() < 4 {
+                    spans.push(Span::styled(" ", Style::default()));
+                }
             }
             lines.push(Line::from(spans));
         }
@@ -231,51 +235,88 @@ impl App {
     }
 
     /// Determine the display character and color for a map cell.
+    /// Incorporates biome colors, resource glow, base pulse,
+    /// and fog-gradient edge.
     fn cell_char(&self, pos: Position) -> (&str, Color) {
-        // 1. Robots on top.
+        let t = &self.visual_theme;
+
+        // ── 1. Robots on top ─────────────────────────────────────
         for scout in &self.scouts {
             if scout.position == pos {
-                return ("x", SCOUT_COLOR);
+                return (t.scout_char, t.scout_color);
             }
         }
         for collector in &self.collectors {
             if collector.position == pos {
-                return ("o", COLLECTOR_COLOR);
+                return (t.collector_char, t.collector_color);
             }
         }
 
-        // 2. Base.
+        // ── 2. Base (with subtle pulse) ──────────────────────────
         if pos == self.sim.world.base() {
-            return ("#", BASE_COLOR);
+            let pulse = self.base_pulse_color(t.base_color);
+            return (t.base_char, pulse);
         }
 
-        let revealed = self.sim.is_cell_revealed(pos);
-        let cell = self.sim.world.cell(pos);
-
-        // 3. Undiscovered — fog of war.
-        if !revealed {
-            // Show obstacles as unknown if they're on the border of revealed area.
-            return (" ", FOG_COLOR);
+        // ── 3. Fog of war (with gradient edge) ───────────────────
+        if !self.sim.is_cell_revealed(pos) {
+            return self.fog_display(pos, t);
         }
 
-        // 4. Obstacles.
-        if cell == Some(Cell::Obstacle) {
-            return ("O", OBSTACLE_COLOR);
+        // ── 4. Obstacles (with biome colors) ────────────────────
+        if self.sim.world.cell(pos) == Some(Cell::Obstacle) {
+            return (t.obstacle_char(pos), t.obstacle_color_for(pos));
         }
 
-        // 5. Resources (only if discovered).
+        // ── 5. Resources (with depletion glow) ───────────────────
         if self.sim.is_resource_discovered(pos)
             && let Some(resource) = self.sim.world.resource_at(pos)
-            && self.sim.stock_remaining_at(pos) > 0
         {
-            return match resource.kind {
-                ResourceKind::Energy => ("E", ENERGY_COLOR),
-                ResourceKind::Crystal => ("C", CRYSTAL_COLOR),
-            };
+            let (remaining, initial) = self.sim.stock_info_at(pos);
+            if remaining > 0 {
+                let (ch, base_color) = t.resource_display(resource.kind);
+                let ratio = remaining as f64 / (initial as f64).max(1.0);
+                let glow = glow_color(base_color, ratio);
+                return (ch, glow);
+            }
         }
 
-        // 6. Walkable ground.
-        (".", GROUND_COLOR)
+        // ── 6. Walkable ground ───────────────────────────────────
+        (t.ground_char, t.ground_color)
+    }
+
+
+    /// Subtle brightness oscillation for the base glyph.
+    fn base_pulse_color(&self, base: Color) -> Color {
+        // Use sine-like oscillation: tick % 30 gives a slow pulse.
+        let phase = (self.tick % 30) as f64 / 30.0;
+        let brightness = 0.75 + 0.25 * (phase * std::f64::consts::TAU).sin();
+        fade_color(base, brightness)
+    }
+
+    /// Fog display with soft edge: cells adjacent to revealed area get a dim hint.
+    fn fog_display(&self, pos: Position, t: &VisualTheme) -> (&str, Color) {
+        let w = self.sim.world.width();
+        let h = self.sim.world.height();
+
+        // Check if any cardinal neighbor (in-bounds) is revealed.
+        let adjacent_revealed = [
+            (pos.x > 0).then(|| Position { x: pos.x - 1, y: pos.y }),
+            (pos.x + 1 < w).then(|| Position { x: pos.x + 1, y: pos.y }),
+            (pos.y > 0).then(|| Position { x: pos.x, y: pos.y - 1 }),
+            (pos.y + 1 < h).then(|| Position { x: pos.x, y: pos.y + 1 }),
+        ]
+        .iter()
+        .filter_map(|&p| p)
+        .any(|p| self.sim.is_cell_revealed(p));
+
+        if adjacent_revealed {
+            // Dim edge — show a subtle character.
+            let edge_char = if t.cell_width > 1 { "·" } else { "." };
+            (edge_char, fade_color(t.fog_color, 0.15))
+        } else {
+            (t.fog_char, t.fog_color)
+        }
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
@@ -295,13 +336,67 @@ impl App {
             )
         };
 
-        let span = Span::styled(text, Style::default().fg(UI_TEXT_COLOR));
+        let span = Span::styled(text, Style::default().fg(Color::White));
         f.render_widget(Paragraph::new(span), area);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Integration tests
+// Free helpers
+// ---------------------------------------------------------------------------
+
+/// Linearly interpolate a color toward black by `factor` (0.0 = black, 1.0 = original).
+fn fade_color(c: Color, factor: f64) -> Color {
+    let (r, g, b) = color_rgb(c);
+    let f = factor.clamp(0.0, 1.0);
+    Color::Rgb((f64::from(r) * f) as u8, (f64::from(g) * f) as u8, (f64::from(b) * f) as u8)
+}
+
+/// Brighten a resource color toward white as the stock depletes.
+fn glow_color(c: Color, ratio: f64) -> Color {
+    // ratio = remaining / max_initial → low ratio = nearly depleted → brighter
+    let r = ratio.clamp(0.0, 1.0);
+    // Mix toward white as r → 0 (depleted).
+    let inv = 1.0 - r;
+    mix_color(c, Color::White, inv * 0.5)
+}
+
+/// Mix two colors: `a * (1-t) + b * t`.
+fn mix_color(a: Color, b: Color, t: f64) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let (ar, ag, ab) = color_rgb(a);
+    let (br, bg, bb) = color_rgb(b);
+    Color::Rgb(
+        (ar as f64 + (br as f64 - ar as f64) * t) as u8,
+        (ag as f64 + (bg as f64 - ag as f64) * t) as u8,
+        (ab as f64 + (bb as f64 - ab as f64) * t) as u8,
+    )
+}
+
+/// Extract (r, g, b) from a Ratatui color.
+fn color_rgb(c: Color) -> (u8, u8, u8) {
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::White => (255, 255, 255),
+        Color::Red => (255, 0, 0),
+        Color::Green => (0, 255, 0),
+        Color::Blue => (0, 0, 255),
+        Color::Yellow => (255, 255, 0),
+        Color::Magenta => (255, 0, 255),
+        Color::Cyan => (0, 255, 255),
+        Color::Gray => (128, 128, 128),
+        Color::DarkGray => (64, 64, 64),
+        Color::LightRed => (255, 204, 203),
+        Color::LightGreen => (144, 238, 144),
+        Color::LightBlue => (173, 216, 230),
+        Color::LightCyan => (224, 255, 255),
+        Color::LightMagenta => (255, 224, 255),
+        Color::LightYellow => (255, 255, 224),
+        _ => (128, 128, 128),
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -309,10 +404,12 @@ impl App {
 mod tests {
     use super::*;
     use crate::collector::CollectorState;
+    use crate::map::{MapPreset, VisualTheme};
 
     #[test]
     fn app_simulation_runs_without_panics() {
-        let mut app = App::new(42).expect("app creation should succeed");
+        let mut app = App::new(42, MapPreset::Default, VisualTheme::DEFAULT)
+            .expect("app creation should succeed");
 
         // Run 500 ticks — enough for scouts to explore and collectors to
         // start finding targets.
@@ -352,7 +449,8 @@ mod tests {
 
     #[test]
     fn app_creates_expected_number_of_robots() {
-        let app = App::new(99).expect("app creation should succeed");
+        let app = App::new(99, MapPreset::Default, VisualTheme::DEFAULT)
+            .expect("app creation should succeed");
         assert_eq!(app.scouts.len(), NUM_SCOUTS as usize);
         assert_eq!(app.collectors.len(), NUM_COLLECTORS as usize);
     }
