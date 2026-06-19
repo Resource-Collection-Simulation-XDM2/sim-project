@@ -236,7 +236,7 @@ impl Scout {
         // Prefer frontiers inside this scout's sector if any exist.
         let sector_width = TAU / (DEFAULT_SCOUT_COUNT as f64);
         let half_width = sector_width / 2.0;
-        let mut sector_frontier: Vec<Position> = frontier_all
+        let sector_frontier: Vec<Position> = frontier_all
             .iter()
             .copied()
             .filter(|goal| {
