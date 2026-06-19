@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::f64::consts::TAU;
+
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokio::sync::mpsc;
@@ -65,10 +68,20 @@ pub struct ScoutStats {
 
 /// Cardinal directions for neighbor enumeration.
 const DIRECTIONS: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
+const DEFAULT_SCOUT_COUNT: u16 = 4;
+/// If a scout finds no frontier in its sector for this many ticks, it will
+/// reassign to the most promising sector seen in its local map.
+const SECTOR_TIMEOUT: u32 = 200;
 
 pub struct Scout {
     pub id: u16,
     pub position: Position,
+    home: Position,
+    exploration_goal: Option<Position>,
+    /// Preferred sector angle (radians, 0..2π) relative to `home`.
+    preferred_sector_angle: f64,
+    /// Number of consecutive ticks with no frontier in the preferred sector.
+    ticks_without_sector_frontier: u32,
     config: ScoutConfig,
     rng: StdRng,
 
@@ -89,11 +102,6 @@ pub struct Scout {
     // World dimensions cached for index math.
     world_width: usize,
     world_height: usize,
-
-    // Reused per-tick buffers to avoid hot-path allocations.
-    neighbor_buf: Vec<Position>,
-    frontier_buf: Vec<Position>,
-    explored_buf: Vec<Position>,
 }
 
 impl Scout {
@@ -107,9 +115,15 @@ impl Scout {
         tx: mpsc::Sender<ScoutMessage>,
     ) -> Self {
         let map_len = world.width() * world.height();
+        let sector_angle = (id as f64 / DEFAULT_SCOUT_COUNT as f64) * TAU;
+
         let mut scout = Self {
             id,
             position: start,
+            home: start,
+            exploration_goal: None,
+            preferred_sector_angle: sector_angle,
+            ticks_without_sector_frontier: 0,
             config,
             rng: StdRng::seed_from_u64(seed),
             explored: vec![false; map_len],
@@ -120,9 +134,6 @@ impl Scout {
             stats: ScoutStats::default(),
             world_width: world.width(),
             world_height: world.height(),
-            neighbor_buf: Vec::with_capacity(4),
-            frontier_buf: Vec::with_capacity(4),
-            explored_buf: Vec::with_capacity(4),
         };
         // Mark starting cell as explored.
         scout.observe_cell(start, world);
@@ -133,56 +144,22 @@ impl Scout {
     pub fn tick(&mut self, world: &World) {
         self.stats.ticks += 1;
 
-        self.neighbor_buf.clear();
-        self.frontier_buf.clear();
-        self.explored_buf.clear();
-
-        for (dx, dy) in DIRECTIONS {
-            let nx = self.position.x as i32 + dx;
-            let ny = self.position.y as i32 + dy;
-            if nx < 0 || ny < 0 || (nx as usize) >= self.world_width || (ny as usize) >= self.world_height {
-                continue;
-            }
-            self.neighbor_buf.push(Position {
-                x: nx as usize,
-                y: ny as usize,
-            });
-        }
-
         // 1. Observe all cardinal neighbors (reveals obstacles / resources).
-        // Track pre-observation exploration state so frontier selection still works.
-        let neighbors = std::mem::take(&mut self.neighbor_buf);
+        let neighbors = self.cardinal_neighbors(self.position);
         for &pos in &neighbors {
-            let idx = self.flat_index(pos);
-            let was_explored = self.explored[idx];
             self.observe_cell(pos, world);
-
-            if self.known_obstacle[idx] {
-                continue; // avoid known obstacles
-            }
-
-            if !was_explored {
-                self.frontier_buf.push(pos);
-            } else {
-                self.explored_buf.push(pos);
-            }
         }
-        self.neighbor_buf = neighbors;
 
-        // 3. Pick movement target.
-        let frontier = std::mem::take(&mut self.frontier_buf);
-        let explored = std::mem::take(&mut self.explored_buf);
-        let target = self.pick_target(&frontier, &explored);
-        self.frontier_buf = frontier;
-        self.explored_buf = explored;
+        // 2. Pick a distant frontier cell, then move one step toward it.
+        let target = self.pick_target(world, &neighbors);
 
-        // 4. Move (if we have somewhere to go).
+        // 3. Move (if we have somewhere to go).
         if let Some(pos) = target {
             self.position = pos;
             self.observe_cell(pos, world);
         }
 
-        // 5. Periodic flush.
+        // 4. Periodic flush.
         self.ticks_since_flush += 1;
         if self.ticks_since_flush >= self.config.flush_interval || self.batch.len() >= self.config.batch_capacity {
             self.flush_batch();
@@ -230,39 +207,248 @@ impl Scout {
         }
     }
 
-    /// Pick a movement target:
-    /// - With `random_move_probability`, pick any walkable neighbor at random.
-    /// - Otherwise, prefer frontier (unexplored) cells.
-    /// - If no frontier, pick a random explored walkable cell.
-    fn pick_target(
-        &mut self,
-        frontier: &[Position],
-        explored: &[Position],
-    ) -> Option<Position> {
-        // Both empty → stuck.
-        if frontier.is_empty() && explored.is_empty() {
+    /// Pick a movement target that pushes the scout toward less explored regions.
+    fn pick_target(&mut self, _world: &World, neighbors: &[Position]) -> Option<Position> {
+        let walkable_neighbors = self.walkable_neighbors(neighbors);
+
+        // Small randomness keeps the four scouts from perfectly overlapping.
+        if self.rng.random_bool(self.config.random_move_probability) {
+            return self.random_choice(&walkable_neighbors);
+        }
+
+        let frontier_all = self.global_frontier();
+        if frontier_all.is_empty() {
+            self.exploration_goal = None;
+            return self.random_choice(&walkable_neighbors);
+        }
+
+        if let Some(goal) = self.exploration_goal
+            && goal != self.position
+            && let Some(step) = self.next_step_toward(goal)
+        {
+            return Some(step);
+        }
+
+        if self.exploration_goal == Some(self.position) {
+            self.exploration_goal = None;
+        }
+
+        // Prefer frontiers inside this scout's sector if any exist.
+        let sector_width = TAU / (DEFAULT_SCOUT_COUNT as f64);
+        let half_width = sector_width / 2.0;
+        let mut sector_frontier: Vec<Position> = frontier_all
+            .iter()
+            .copied()
+            .filter(|goal| {
+                let dx = goal.x as f64 - self.home.x as f64;
+                let dy = goal.y as f64 - self.home.y as f64;
+                let angle = dy.atan2(dx).rem_euclid(TAU);
+                angle_diff(angle, self.preferred_sector_angle) <= half_width
+            })
+            .collect();
+
+        // Update sector timeout counter.
+        if !sector_frontier.is_empty() {
+            self.ticks_without_sector_frontier = 0;
+        } else {
+            self.ticks_without_sector_frontier = self.ticks_without_sector_frontier.saturating_add(1);
+        }
+
+        // If the scout hasn't seen any frontier in its sector for a while,
+        // reassign its preferred sector toward the most promising global
+        // frontier observed.
+        if self.ticks_without_sector_frontier > SECTOR_TIMEOUT {
+            // Choose best global frontier and set preferred angle toward it.
+            let mut best_goal = None;
+            let mut best_score = i32::MIN;
+            for goal in &frontier_all {
+                let score = self.frontier_score(*goal);
+                if score > best_score {
+                    best_score = score;
+                    best_goal = Some(*goal);
+                }
+            }
+
+            if let Some(g) = best_goal {
+                let dx = g.x as f64 - self.home.x as f64;
+                let dy = g.y as f64 - self.home.y as f64;
+                self.preferred_sector_angle = dy.atan2(dx).rem_euclid(TAU);
+                self.exploration_goal = Some(g);
+            }
+            self.ticks_without_sector_frontier = 0;
+        }
+
+        let search_frontier = if !sector_frontier.is_empty() {
+            sector_frontier
+        } else {
+            frontier_all
+        };
+
+        let mut best_goal = None;
+        let mut best_score = i32::MIN;
+
+        for goal in search_frontier {
+            let score = self.frontier_score(goal);
+            if score > best_score {
+                best_score = score;
+                best_goal = Some(goal);
+            }
+        }
+
+        self.exploration_goal = best_goal;
+
+        if let Some(goal) = best_goal
+            && let Some(step) = self.next_step_toward(goal)
+        {
+            return Some(step);
+        }
+
+        self.exploration_goal = None;
+
+        self.random_choice(&walkable_neighbors)
+    }
+
+    fn frontier_score(&self, goal: Position) -> i32 {
+        let current_to_goal = manhattan(self.position, goal) as i32;
+        let home_to_goal = manhattan(self.home, goal) as i32;
+        // Compute angular preference: goals near the scout's sector angle are favored.
+        let dx = goal.x as f64 - self.home.x as f64;
+        let dy = goal.y as f64 - self.home.y as f64;
+        let angle = dy.atan2(dx).rem_euclid(TAU);
+        let diff = angle_diff(angle, self.preferred_sector_angle);
+        // diff in [0, PI]. Map to a small penalty in integer score.
+        let angular_penalty = (diff / std::f64::consts::PI) * 10.0;
+
+        (current_to_goal + home_to_goal * 2) - (angular_penalty as i32)
+    }
+
+    fn global_frontier(&self) -> Vec<Position> {
+        let mut frontier = Vec::new();
+
+        for y in 0..self.world_height {
+            for x in 0..self.world_width {
+                let pos = Position { x, y };
+                let idx = self.flat_index(pos);
+
+                if !self.explored[idx] || self.known_obstacle[idx] {
+                    continue;
+                }
+
+                if self.has_unexplored_neighbor(pos) {
+                    frontier.push(pos);
+                }
+            }
+        }
+
+        frontier
+    }
+
+    fn has_unexplored_neighbor(&self, pos: Position) -> bool {
+        self.cardinal_neighbors(pos)
+            .into_iter()
+            .any(|neighbor| !self.explored[self.flat_index(neighbor)])
+    }
+
+    fn next_step_toward(&self, goal: Position) -> Option<Position> {
+        let start_idx = self.flat_index(self.position);
+        let goal_idx = self.flat_index(goal);
+
+        if start_idx == goal_idx {
             return None;
         }
 
-        // Random exploration jitter.
-        if self.rng.random_bool(self.config.random_move_probability) {
-            let all_len = frontier.len() + explored.len();
-            let idx = self.rng.random_range(0..all_len);
-            return if idx < frontier.len() {
-                Some(frontier[idx])
-            } else {
-                Some(explored[idx - frontier.len()])
-            };
+        let mut previous = vec![usize::MAX; self.explored.len()];
+        let mut queue = VecDeque::new();
+        previous[start_idx] = start_idx;
+        queue.push_back(start_idx);
+
+        while let Some(idx) = queue.pop_front() {
+            if idx == goal_idx {
+                break;
+            }
+
+            for neighbor in self.known_walkable_neighbors_from_idx(idx) {
+                if previous[neighbor] != usize::MAX {
+                    continue;
+                }
+
+                previous[neighbor] = idx;
+                queue.push_back(neighbor);
+            }
         }
 
-        // Frontier-biased: prefer unexplored.
-        if !frontier.is_empty() {
-            let idx = self.rng.random_range(0..frontier.len());
-            return Some(frontier[idx]);
+        if previous[goal_idx] == usize::MAX {
+            return None;
         }
 
-        let idx = self.rng.random_range(0..explored.len());
-        Some(explored[idx])
+        let mut step = goal_idx;
+        while previous[step] != start_idx {
+            step = previous[step];
+        }
+
+        Some(self.position_from_index(step))
+    }
+
+    fn known_walkable_neighbors_from_idx(&self, idx: usize) -> impl Iterator<Item = usize> + '_ {
+        let x = idx % self.world_width;
+        let y = idx / self.world_width;
+
+        DIRECTIONS.into_iter().filter_map(move |(dx, dy)| {
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            if nx < 0 || ny < 0 {
+                return None;
+            }
+
+            let nx = nx as usize;
+            let ny = ny as usize;
+            if nx >= self.world_width || ny >= self.world_height {
+                return None;
+            }
+
+            let neighbor = ny * self.world_width + nx;
+            if !self.explored[neighbor] || self.known_obstacle[neighbor] {
+                return None;
+            }
+
+            Some(neighbor)
+        })
+    }
+
+    fn cardinal_neighbors(&self, pos: Position) -> Vec<Position> {
+        let mut neighbors = Vec::with_capacity(4);
+
+        for (dx, dy) in DIRECTIONS {
+            let nx = pos.x as i32 + dx;
+            let ny = pos.y as i32 + dy;
+            if nx < 0 || ny < 0 || (nx as usize) >= self.world_width || (ny as usize) >= self.world_height {
+                continue;
+            }
+
+            neighbors.push(Position {
+                x: nx as usize,
+                y: ny as usize,
+            });
+        }
+
+        neighbors
+    }
+
+    fn walkable_neighbors(&self, neighbors: &[Position]) -> Vec<Position> {
+        neighbors
+            .iter()
+            .copied()
+            .filter(|pos| !self.known_obstacle[self.flat_index(*pos)])
+            .collect()
+    }
+
+    fn random_choice(&mut self, positions: &[Position]) -> Option<Position> {
+        if positions.is_empty() {
+            return None;
+        }
+
+        let idx = self.rng.random_range(0..positions.len());
+        Some(positions[idx])
     }
 
     /// Flush the discovery batch to the base channel.
@@ -299,6 +485,25 @@ impl Scout {
     fn flat_index(&self, pos: Position) -> usize {
         pos.y * self.world_width + pos.x
     }
+
+    #[inline]
+    fn position_from_index(&self, idx: usize) -> Position {
+        Position {
+            x: idx % self.world_width,
+            y: idx / self.world_width,
+        }
+    }
+}
+
+#[inline]
+fn manhattan(a: Position, b: Position) -> usize {
+    a.x.abs_diff(b.x) + a.y.abs_diff(b.y)
+}
+
+/// Minimal absolute difference between two angles in radians (0..2π), result in [0, PI]
+fn angle_diff(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs() % TAU;
+    if d > std::f64::consts::PI { TAU - d } else { d }
 }
 
 // ---------------------------------------------------------------------------
