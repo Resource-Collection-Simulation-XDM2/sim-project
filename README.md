@@ -60,6 +60,8 @@ A real-time terminal-based autonomous robotics simulation written in Rust. Scout
 
 - Live resource inventory counter (Energy + Crystals collected)
 - Remaining resources on the map
+- Progress bar that tracks total crystal collection toward mission completion
+- Simulation ends automatically when the crystal progress gauge reaches 100%
 - Frame rate and tick counter
 
 ---
@@ -187,6 +189,7 @@ cargo run -- d emoji 12345 reveal
 
 - Press **any key** to exit the simulation
 - The simulation displays the final resource collection tally
+- The simulation also ends automatically when the crystal progress gauge reaches 100%
 
 ---
 
