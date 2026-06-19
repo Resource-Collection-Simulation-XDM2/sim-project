@@ -8,7 +8,7 @@ Requirements:
 - Rust stable toolchain
 - Cargo
 
-Install dependencies and verify build:
+Install dependencies and verify build: 
 
 ```bash
 cargo check
