@@ -5,11 +5,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
-use ratatui::{Frame, Terminal};
+use ratatui::Terminal;
 use tokio::sync::{mpsc, Barrier, RwLock};
 
 use crate::collision::OccupancyGrid;
@@ -18,7 +14,8 @@ use crate::concurrency::{self, SharedOcc, SharedSim};
 use crate::map::{MapPreset, VisualTheme};
 use crate::scout::{Discovery, Scout, ScoutConfig, ScoutMessage};
 use crate::simulation::{RevealMode, Simulation};
-use crate::world::{Cell, Position, World};
+use crate::ui;
+use crate::world::{Position, World};
 
 const NUM_SCOUTS: u16 = 4;
 const NUM_COLLECTORS: u16 = 3;
@@ -27,7 +24,29 @@ const FRAME_DURATION: Duration = Duration::from_millis(33);
 
 /// Which type of robot occupies a cell (for O(1) rendering lookup).
 #[derive(Clone, Copy)]
-enum RobotKind { Scout, Collector }
+pub(crate) enum RobotKind {
+    Scout,
+    Collector,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct AppSnapshot<'a> {
+    pub(crate) sim_world: &'a World,
+    pub(crate) visual_theme: &'a VisualTheme,
+    pub(crate) robot_at: &'a [Option<RobotKind>],
+    pub(crate) revealed_cache: &'a [bool],
+    pub(crate) cached_energy: u64,
+    pub(crate) cached_crystals: u64,
+    pub(crate) cached_remaining: u64,
+    pub(crate) stock_at_cache: &'a [Option<usize>],
+    pub(crate) stock_remaining_cache: &'a [u16],
+    pub(crate) stock_initial_cache: &'a [u16],
+    pub(crate) resource_discovered_cache: &'a [bool],
+    pub(crate) cached_initial_total: u64,
+    pub(crate) tick: u64,
+    pub(crate) num_scouts: u16,
+    pub(crate) num_collectors: u16,
+}
 
 pub struct App {
     sim: SharedSim,
@@ -205,7 +224,8 @@ impl App {
             }
 
             self.tick += 1;
-            terminal.draw(|f| self.render(f))?;
+            let snapshot = self.snapshot();
+            terminal.draw(|f| ui::render(f, &snapshot))?;
 
             if event::poll(FRAME_DURATION)? {
                 if is_quit_key(&event::read()?) {
@@ -215,7 +235,8 @@ impl App {
 
             {
                 if self.cached_remaining == 0 {
-                    terminal.draw(|f| self.render(f))?;
+                    let snapshot = self.snapshot();
+                    terminal.draw(|f| ui::render(f, &snapshot))?;
                     loop {
                         if event::poll(Duration::from_millis(100))? {
                             if is_quit_key(&event::read()?) {
@@ -233,236 +254,31 @@ impl App {
         Ok(())
     }
 
-    fn render(&self, f: &mut Frame) {
-        let area = f.area();
-        let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(6)]).split(area);
-        self.render_map(f, layout[0]);
-        self.render_status(f, layout[1]);
-    }
-
-    fn render_map(&self, f: &mut Frame, area: Rect) {
-        let w = self.sim_world.width();
-        let h = self.sim_world.height();
-        let cw = self.visual_theme.cell_width as usize;
-        let mut lines: Vec<Line> = Vec::with_capacity(h);
-        for y in 0..h {
-            let mut spans: Vec<Span> = Vec::with_capacity(w * cw);
-            for x in 0..w {
-                let pos = Position { x, y };
-                let (ch, color) = self.cell_char(pos);
-                spans.push(Span::styled(ch, Style::default().fg(color)));
-                if cw > 1 && ch.len() < 4 {
-                    spans.push(Span::styled(" ", Style::default()));
-                }
-            }
-            lines.push(Line::from(spans));
-        }
-        f.render_widget(Paragraph::new(lines), area);
-    }
-
-    fn cell_char(&self, pos: Position) -> (&str, Color) {
-        let t = &self.visual_theme;
-        let idx = pos.y * self.sim_world.width() + pos.x;
-        // O(1) bitmap lookup instead of Vec::contains scan.
-        match self.robot_at.get(idx).copied().flatten() {
-            Some(RobotKind::Scout) => return (t.scout_char, t.scout_color),
-            Some(RobotKind::Collector) => return (t.collector_char, t.collector_color),
-            None => {}
-        }
-        if pos == self.sim_world.base() {
-            return (t.base_char, self.base_pulse_color(t.base_color));
-        }
-        let revealed = self.revealed_cache.get(idx).copied().unwrap_or(false);
-        if !revealed {
-            return self.fog_display(pos, t);
-        }
-        if self.sim_world.cell(pos) == Some(Cell::Obstacle) {
-            return (t.obstacle_char(pos), t.obstacle_color_for(pos));
-        }
-        // Use cached stock data — no lock needed, zero flicker.
-        if let Some(stock_idx) = self.stock_at_cache.get(idx).copied().flatten()
-            && stock_idx < self.resource_discovered_cache.len()
-            && self.resource_discovered_cache[stock_idx]
-            && stock_idx < self.stock_remaining_cache.len()
-        {
-            let remaining = self.stock_remaining_cache[stock_idx];
-            if remaining > 0 {
-                let initial = self.stock_initial_cache[stock_idx];
-                let ratio = remaining as f64 / (initial as f64).max(1.0);
-                let resource = &self.sim_world.resources()[stock_idx];
-                let (ch, base_color) = t.resource_display(resource.kind);
-                return (ch, self.resource_pulse_color(base_color, ratio));
-            }
-        }
-        (t.ground_char, t.ground_color)
-    }
-
-    fn base_pulse_color(&self, base: Color) -> Color {
-        let phase = (self.tick % 30) as f64 / 30.0;
-        fade_color(base, 0.75 + 0.25 * (phase * std::f64::consts::TAU).sin())
-    }
-
-    /// Smooth pulse + depletion fade for resources, like the base glow.
-    fn resource_pulse_color(&self, base_color: Color, ratio: f64) -> Color {
-        let phase = (self.tick % 30) as f64 / 30.0;
-        let pulse = 0.80 + 0.20 * (phase * std::f64::consts::TAU).sin();
-        let depleted = glow_color(base_color, ratio);
-        fade_color(depleted, pulse)
-    }
-
-    fn fog_display(&self, pos: Position, t: &VisualTheme) -> (&str, Color) {
-        let w = self.sim_world.width();
-        let h = self.sim_world.height();
-        let revealed = |p: Position| {
-            let i = p.y * w + p.x;
-            self.revealed_cache.get(i).copied().unwrap_or(false)
-        };
-        let adj = [
-            (pos.x > 0).then(|| Position { x: pos.x - 1, y: pos.y }),
-            (pos.x + 1 < w).then(|| Position { x: pos.x + 1, y: pos.y }),
-            (pos.y > 0).then(|| Position { x: pos.x, y: pos.y - 1 }),
-            (pos.y + 1 < h).then(|| Position { x: pos.x, y: pos.y + 1 }),
-        ].iter().filter_map(|&p| p).any(revealed);
-        if adj {
-            let edge_char = if t.cell_width > 1 { "·" } else { "." };
-            (edge_char, fade_color(t.fog_color, 0.15))
-        } else {
-            (t.fog_char, t.fog_color)
-        }
-    }
-
-    fn render_status(&self, f: &mut Frame, area: Rect) {
-        let t = &self.visual_theme;
-        let done = self.cached_remaining == 0;
-        let initial = self.cached_initial_total.max(1);
-        let progress = if done {
-            1.0
-        } else {
-            (initial - self.cached_remaining) as f64 / initial as f64
-        };
-        let pct = (progress * 100.0).round() as u16;
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if done {
-                Color::LightGreen
-            } else {
-                Color::DarkGray
-            }))
-            .title(if done {
-                Line::from(Span::styled(
-                    " ✓ Mission complete ",
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from(Span::styled(
-                    " Resource Collection ",
-                    Style::default().fg(Color::Cyan),
-                ))
-            });
-
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        let rows = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-        let row1 = Line::from(vec![
-            Span::styled("Tick ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:<6}", self.tick),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  │  "),
-            Span::styled(
-                format!("{} Scouts", NUM_SCOUTS),
-                Style::default().fg(t.scout_color),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{} Collectors", NUM_COLLECTORS),
-                Style::default().fg(t.collector_color),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(row1), rows[0]);
-
-        let row2 = Line::from(vec![
-            Span::styled(
-                format!(" {} ", t.energy_char),
-                Style::default().fg(t.energy_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("Energy ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:<6}", self.cached_energy),
-                Style::default().fg(t.energy_color),
-            ),
-            Span::raw("  │  "),
-            Span::styled(
-                format!(" {} ", t.crystal_char),
-                Style::default()
-                    .fg(t.crystal_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("Crystals ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:<6}", self.cached_crystals),
-                Style::default().fg(t.crystal_color),
-            ),
-            Span::raw("  │  "),
-            Span::styled("Left ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", self.cached_remaining),
-                Style::default().fg(if done { Color::LightGreen } else { Color::Yellow }),
-            ),
-        ]);
-        f.render_widget(Paragraph::new(row2), rows[1]);
-
-        let gauge_color = if done { Color::LightGreen } else { Color::Green };
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
-            .ratio(progress.min(1.0))
-            .label(format!("{pct}% collected"));
-        f.render_widget(gauge, rows[2]);
-
-        let hint = if done {
-            Line::from(vec![
-                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Q",
-                    Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" to exit", Style::default().fg(Color::DarkGray)),
-            ])
-        } else {
-            Line::from(vec![
-                Span::styled("● ", Style::default().fg(Color::Green)),
-                Span::styled("Running", Style::default().fg(Color::White)),
-                Span::styled("  —  press ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Q",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" to quit", Style::default().fg(Color::DarkGray)),
-            ])
-        };
-        f.render_widget(
-            Paragraph::new(hint).alignment(Alignment::Center),
-            rows[3],
-        );
-    }
-
     #[inline]
     fn set_robot_at(&mut self, pos: Position, kind: Option<RobotKind>) {
         let idx = pos.y * self.sim_world.width() + pos.x;
         if idx < self.robot_at.len() {
             self.robot_at[idx] = kind;
+        }
+    }
+
+    fn snapshot(&self) -> AppSnapshot<'_> {
+        AppSnapshot {
+            sim_world: &self.sim_world,
+            visual_theme: &self.visual_theme,
+            robot_at: &self.robot_at,
+            revealed_cache: &self.revealed_cache,
+            cached_energy: self.cached_energy,
+            cached_crystals: self.cached_crystals,
+            cached_remaining: self.cached_remaining,
+            stock_at_cache: &self.stock_at_cache,
+            stock_remaining_cache: &self.stock_remaining_cache,
+            stock_initial_cache: &self.stock_initial_cache,
+            resource_discovered_cache: &self.resource_discovered_cache,
+            cached_initial_total: self.cached_initial_total,
+            tick: self.tick,
+            num_scouts: NUM_SCOUTS,
+            num_collectors: NUM_COLLECTORS,
         }
     }
 }
@@ -472,41 +288,6 @@ fn is_quit_key(event: &Event) -> bool {
         event,
         Event::Key(key) if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q')
     )
-}
-
-fn fade_color(c: Color, factor: f64) -> Color {
-    let (r, g, b) = color_rgb(c);
-    let f = factor.clamp(0.0, 1.0);
-    Color::Rgb((f64::from(r) * f) as u8, (f64::from(g) * f) as u8, (f64::from(b) * f) as u8)
-}
-
-fn glow_color(c: Color, ratio: f64) -> Color {
-    mix_color(c, Color::White, (1.0 - ratio.clamp(0.0, 1.0)) * 0.5)
-}
-
-fn mix_color(a: Color, b: Color, t: f64) -> Color {
-    let t = t.clamp(0.0, 1.0);
-    let (ar, ag, ab) = color_rgb(a);
-    let (br, bg, bb) = color_rgb(b);
-    Color::Rgb(
-        (ar as f64 + (br as f64 - ar as f64) * t) as u8,
-        (ag as f64 + (bg as f64 - ag as f64) * t) as u8,
-        (ab as f64 + (bb as f64 - ab as f64) * t) as u8,
-    )
-}
-
-fn color_rgb(c: Color) -> (u8, u8, u8) {
-    match c {
-        Color::Rgb(r, g, b) => (r, g, b),
-        Color::Black => (0, 0, 0), Color::White => (255, 255, 255),
-        Color::Red => (255, 0, 0), Color::Green => (0, 255, 0), Color::Blue => (0, 0, 255),
-        Color::Yellow => (255, 255, 0), Color::Magenta => (255, 0, 255), Color::Cyan => (0, 255, 255),
-        Color::Gray => (128, 128, 128), Color::DarkGray => (64, 64, 64),
-        Color::LightRed => (255, 204, 203), Color::LightGreen => (144, 238, 144),
-        Color::LightBlue => (173, 216, 230), Color::LightCyan => (224, 255, 255),
-        Color::LightMagenta => (255, 224, 255), Color::LightYellow => (255, 255, 224),
-        _ => (128, 128, 128),
-    }
 }
 
 #[cfg(test)]
