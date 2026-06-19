@@ -5,10 +5,10 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::{mpsc, Barrier, RwLock};
 
@@ -52,6 +52,7 @@ pub struct App {
     stock_remaining_cache: Vec<u16>,
     stock_initial_cache: Vec<u16>,
     resource_discovered_cache: Vec<bool>,
+    cached_initial_total: u64,
     tick: u64,
     done: bool,
 }
@@ -116,6 +117,7 @@ impl App {
             stock_remaining_cache: vec![0; stock_count],
             stock_initial_cache: vec![0; stock_count],
             resource_discovered_cache: vec![false; stock_count],
+            cached_initial_total: initial_remaining,
             tick: 0, done: false,
         })
     }
@@ -126,6 +128,11 @@ impl App {
         stdout.execute(EnterAlternateScreen)?;
         let backend = ratatui::backend::CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+
+        // Discard keys still buffered from launching (e.g. Enter after `cargo run`).
+        while event::poll(Duration::from_millis(0))? {
+            let _ = event::read()?;
+        }
 
         while !self.done {
             // Prepare occupancy grid for this tick.
@@ -201,10 +208,8 @@ impl App {
             terminal.draw(|f| self.render(f))?;
 
             if event::poll(FRAME_DURATION)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
-                        self.done = true;
-                    }
+                if is_quit_key(&event::read()?) {
+                    self.done = true;
                 }
             }
 
@@ -213,10 +218,8 @@ impl App {
                     terminal.draw(|f| self.render(f))?;
                     loop {
                         if event::poll(Duration::from_millis(100))? {
-                            if let Event::Key(key) = event::read()? {
-                                if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
-                                    break;
-                                }
+                            if is_quit_key(&event::read()?) {
+                                break;
                             }
                         }
                     }
@@ -232,7 +235,7 @@ impl App {
 
     fn render(&self, f: &mut Frame) {
         let area = f.area();
-        let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
+        let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(6)]).split(area);
         self.render_map(f, layout[0]);
         self.render_status(f, layout[1]);
     }
@@ -329,13 +332,130 @@ impl App {
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
+        let t = &self.visual_theme;
         let done = self.cached_remaining == 0;
-        let text = if done {
-            format!("T:{}  E:{}  C:{}  Left:0  —  DONE!  Press any key", self.tick, self.cached_energy, self.cached_crystals)
+        let initial = self.cached_initial_total.max(1);
+        let progress = if done {
+            1.0
         } else {
-            format!("T:{}  E:{}  C:{}  Left:{}  —  running…", self.tick, self.cached_energy, self.cached_crystals, self.cached_remaining)
+            (initial - self.cached_remaining) as f64 / initial as f64
         };
-        f.render_widget(Paragraph::new(Span::styled(text, Style::default())), area);
+        let pct = (progress * 100.0).round() as u16;
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if done {
+                Color::LightGreen
+            } else {
+                Color::DarkGray
+            }))
+            .title(if done {
+                Line::from(Span::styled(
+                    " ✓ Mission complete ",
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    " Resource Collection ",
+                    Style::default().fg(Color::Cyan),
+                ))
+            });
+
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+        let row1 = Line::from(vec![
+            Span::styled("Tick ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<6}", self.tick),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  │  "),
+            Span::styled(
+                format!("{} Scouts", NUM_SCOUTS),
+                Style::default().fg(t.scout_color),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} Collectors", NUM_COLLECTORS),
+                Style::default().fg(t.collector_color),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(row1), rows[0]);
+
+        let row2 = Line::from(vec![
+            Span::styled(
+                format!(" {} ", t.energy_char),
+                Style::default().fg(t.energy_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Energy ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<6}", self.cached_energy),
+                Style::default().fg(t.energy_color),
+            ),
+            Span::raw("  │  "),
+            Span::styled(
+                format!(" {} ", t.crystal_char),
+                Style::default()
+                    .fg(t.crystal_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Crystals ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<6}", self.cached_crystals),
+                Style::default().fg(t.crystal_color),
+            ),
+            Span::raw("  │  "),
+            Span::styled("Left ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", self.cached_remaining),
+                Style::default().fg(if done { Color::LightGreen } else { Color::Yellow }),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(row2), rows[1]);
+
+        let gauge_color = if done { Color::LightGreen } else { Color::Green };
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
+            .ratio(progress.min(1.0))
+            .label(format!("{pct}% collected"));
+        f.render_widget(gauge, rows[2]);
+
+        let hint = if done {
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Q",
+                    Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to exit", Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("● ", Style::default().fg(Color::Green)),
+                Span::styled("Running", Style::default().fg(Color::White)),
+                Span::styled("  —  press ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Q",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to quit", Style::default().fg(Color::DarkGray)),
+            ])
+        };
+        f.render_widget(
+            Paragraph::new(hint).alignment(Alignment::Center),
+            rows[3],
+        );
     }
 
     #[inline]
@@ -345,6 +465,13 @@ impl App {
             self.robot_at[idx] = kind;
         }
     }
+}
+
+fn is_quit_key(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key) if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q')
+    )
 }
 
 fn fade_color(c: Color, factor: f64) -> Color {
