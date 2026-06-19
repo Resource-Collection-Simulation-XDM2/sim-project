@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, Barrier, RwLock};
 
-use crate::collision::{self, OccupancyGrid};
+use crate::occupancy::{self, OccupancyGrid};
 use crate::collector::Collector;
 use crate::scout::Scout;
 use crate::simulation::Simulation;
@@ -52,7 +52,7 @@ pub async fn run_scout(
             // Resolve collision.
             let sim_guard = sim.read().await;
             let mut occ = occupancy.write().await;
-            collision::resolve(&mut scout.position, old, &mut occ, &sim_guard.world);
+            occupancy::resolve(&mut scout.position, old, &mut occ, &sim_guard.world);
         }
         // Notify main thread of new position.
         let _ = position_tx.try_send((scout.id, scout.position));
@@ -90,7 +90,7 @@ pub async fn run_collector(
         {
             let sim_guard = sim.read().await;
             let mut occ = occupancy.write().await;
-            collision::resolve(&mut collector.position, old, &mut occ, &sim_guard.world);
+            occupancy::resolve(&mut collector.position, old, &mut occ, &sim_guard.world);
         }
         // Notify main thread of new position.
         let _ = position_tx.try_send((collector.id, collector.position));

@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::{mpsc, Barrier, RwLock};
 
-use crate::collision::OccupancyGrid;
+use crate::occupancy::OccupancyGrid;
 use crate::collector::{Collector, CollectorConfig, CollectorMessage};
 use crate::concurrency::{self, SharedOcc, SharedSim};
 use crate::map::{MapPreset, VisualTheme};
@@ -207,20 +207,20 @@ impl App {
             self.tick += 1;
             terminal.draw(|f| self.render(f))?;
 
-            if event::poll(FRAME_DURATION)? {
-                if is_quit_key(&event::read()?) {
-                    self.done = true;
-                }
+            if event::poll(FRAME_DURATION)?
+                && is_quit_key(&event::read()?)
+            {
+                self.done = true;
             }
 
             {
                 if self.cached_remaining == 0 {
                     terminal.draw(|f| self.render(f))?;
                     loop {
-                        if event::poll(Duration::from_millis(100))? {
-                            if is_quit_key(&event::read()?) {
-                                break;
-                            }
+                        if event::poll(Duration::from_millis(100))?
+                            && is_quit_key(&event::read()?)
+                        {
+                            break;
                         }
                     }
                     self.done = true;
