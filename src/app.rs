@@ -47,6 +47,11 @@ pub struct App {
     cached_energy: u64,
     cached_crystals: u64,
     cached_remaining: u64,
+    /// Cached resource stock data — avoids lock contention during rendering.
+    stock_at_cache: Vec<Option<usize>>,
+    stock_remaining_cache: Vec<u16>,
+    stock_initial_cache: Vec<u16>,
+    resource_discovered_cache: Vec<bool>,
     tick: u64,
     done: bool,
 }
@@ -95,6 +100,7 @@ impl App {
         drop(position_tx);
 
         let initial_remaining: u64 = sim_world_clone.resources().iter().map(|n| u64::from(n.quantity)).sum();
+        let stock_count = sim_world_clone.resources().len();
 
         Ok(Self {
             sim, sim_world: sim_world_clone, occupancy: occupancy.clone(), visual_theme,
@@ -106,6 +112,10 @@ impl App {
             cached_energy: 0,
             cached_crystals: 0,
             cached_remaining: initial_remaining,
+            stock_at_cache: vec![None; cell_count],
+            stock_remaining_cache: vec![0; stock_count],
+            stock_initial_cache: vec![0; stock_count],
+            resource_discovered_cache: vec![false; stock_count],
             tick: 0, done: false,
         })
     }
@@ -129,11 +139,13 @@ impl App {
 
             self.barrier.wait().await;
 
-            // Clear old robot positions from bitmap.
-            let old_scout: Vec<Position> = self.scout_positions.to_vec();
-            let old_collector: Vec<Position> = self.collector_positions.to_vec();
-            for p in &old_scout { self.set_robot_at(*p, None); }
-            for p in &old_collector { self.set_robot_at(*p, None); }
+            // Clear old robot positions from bitmap — index-based, no alloc.
+            for i in 0..self.scout_positions.len() {
+                self.set_robot_at(self.scout_positions[i], None);
+            }
+            for i in 0..self.collector_positions.len() {
+                self.set_robot_at(self.collector_positions[i], None);
+            }
 
             while let Ok((id, pos)) = self.position_rx.try_recv() {
                 if id < NUM_SCOUTS {
@@ -146,11 +158,13 @@ impl App {
                 }
             }
 
-            // Rebuild bitmap from updated positions.
-            let new_scout: Vec<Position> = self.scout_positions.to_vec();
-            let new_collector: Vec<Position> = self.collector_positions.to_vec();
-            for p in &new_scout { self.set_robot_at(*p, Some(RobotKind::Scout)); }
-            for p in &new_collector { self.set_robot_at(*p, Some(RobotKind::Collector)); }
+            // Rebuild bitmap from updated positions — index-based, no alloc.
+            for i in 0..self.scout_positions.len() {
+                self.set_robot_at(self.scout_positions[i], Some(RobotKind::Scout));
+            }
+            for i in 0..self.collector_positions.len() {
+                self.set_robot_at(self.collector_positions[i], Some(RobotKind::Collector));
+            }
 
             {
                 let mut sim_guard = self.sim.write().await;
@@ -173,6 +187,14 @@ impl App {
                 self.cached_energy = sim_guard.base_inventory.energy;
                 self.cached_crystals = sim_guard.base_inventory.crystals;
                 self.cached_remaining = sim_guard.total_remaining();
+
+                // Snapshot resource stock data so rendering never needs the lock.
+                self.stock_at_cache.copy_from_slice(&sim_guard.stock_at);
+                for (i, stock) in sim_guard.stocks.iter().enumerate() {
+                    self.stock_remaining_cache[i] = stock.remaining;
+                    self.stock_initial_cache[i] = stock.initial;
+                    self.resource_discovered_cache[i] = sim_guard.resource_discovered[i];
+                }
             }
 
             self.tick += 1;
@@ -237,8 +259,8 @@ impl App {
 
     fn cell_char(&self, pos: Position) -> (&str, Color) {
         let t = &self.visual_theme;
-        // O(1) bitmap lookup instead of Vec::contains scan.
         let idx = pos.y * self.sim_world.width() + pos.x;
+        // O(1) bitmap lookup instead of Vec::contains scan.
         match self.robot_at.get(idx).copied().flatten() {
             Some(RobotKind::Scout) => return (t.scout_char, t.scout_color),
             Some(RobotKind::Collector) => return (t.collector_char, t.collector_color),
@@ -247,7 +269,6 @@ impl App {
         if pos == self.sim_world.base() {
             return (t.base_char, self.base_pulse_color(t.base_color));
         }
-        let idx = pos.y * self.sim_world.width() + pos.x;
         let revealed = self.revealed_cache.get(idx).copied().unwrap_or(false);
         if !revealed {
             return self.fog_display(pos, t);
@@ -255,20 +276,35 @@ impl App {
         if self.sim_world.cell(pos) == Some(Cell::Obstacle) {
             return (t.obstacle_char(pos), t.obstacle_color_for(pos));
         }
-        if let Ok(sim_guard) = self.sim.try_read()
-            && sim_guard.is_resource_discovered(pos) && let Some(resource) = self.sim_world.resource_at(pos) {
-                let (remaining, initial) = sim_guard.stock_info_at(pos);
-                if remaining > 0 {
-                    let (ch, base_color) = t.resource_display(resource.kind);
-                    return (ch, glow_color(base_color, remaining as f64 / (initial as f64).max(1.0)));
-                }
+        // Use cached stock data — no lock needed, zero flicker.
+        if let Some(stock_idx) = self.stock_at_cache.get(idx).copied().flatten()
+            && stock_idx < self.resource_discovered_cache.len()
+            && self.resource_discovered_cache[stock_idx]
+            && stock_idx < self.stock_remaining_cache.len()
+        {
+            let remaining = self.stock_remaining_cache[stock_idx];
+            if remaining > 0 {
+                let initial = self.stock_initial_cache[stock_idx];
+                let ratio = remaining as f64 / (initial as f64).max(1.0);
+                let resource = &self.sim_world.resources()[stock_idx];
+                let (ch, base_color) = t.resource_display(resource.kind);
+                return (ch, self.resource_pulse_color(base_color, ratio));
             }
+        }
         (t.ground_char, t.ground_color)
     }
 
     fn base_pulse_color(&self, base: Color) -> Color {
         let phase = (self.tick % 30) as f64 / 30.0;
         fade_color(base, 0.75 + 0.25 * (phase * std::f64::consts::TAU).sin())
+    }
+
+    /// Smooth pulse + depletion fade for resources, like the base glow.
+    fn resource_pulse_color(&self, base_color: Color, ratio: f64) -> Color {
+        let phase = (self.tick % 30) as f64 / 30.0;
+        let pulse = 0.80 + 0.20 * (phase * std::f64::consts::TAU).sin();
+        let depleted = glow_color(base_color, ratio);
+        fade_color(depleted, pulse)
     }
 
     fn fog_display(&self, pos: Position, t: &VisualTheme) -> (&str, Color) {
