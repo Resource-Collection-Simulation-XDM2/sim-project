@@ -40,13 +40,13 @@ pub struct ResourceStock {
 #[derive(Debug, Clone)]
 pub struct Simulation {
     pub world: World,
-    stocks: Vec<ResourceStock>,
-    stock_at: Vec<Option<usize>>,
+    pub(crate) stocks: Vec<ResourceStock>,
+    pub(crate) stock_at: Vec<Option<usize>>,
     pub base_inventory: BaseInventory,
 
     // Fog-of-war / knowledge tracking.
-    cells_revealed: Vec<bool>,
-    resource_discovered: Vec<bool>,
+    pub(crate) cells_revealed: Vec<bool>,
+    pub(crate) resource_discovered: Vec<bool>,
 }
 
 impl Simulation {

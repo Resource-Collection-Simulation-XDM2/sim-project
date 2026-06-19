@@ -5,10 +5,10 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Gauge, Paragraph};
 use ratatui::{Frame, Terminal};
 use tokio::sync::{mpsc, Barrier, RwLock};
 
@@ -47,6 +47,12 @@ pub struct App {
     cached_energy: u64,
     cached_crystals: u64,
     cached_remaining: u64,
+    /// Cached resource stock data — avoids lock contention during rendering.
+    stock_at_cache: Vec<Option<usize>>,
+    stock_remaining_cache: Vec<u16>,
+    stock_initial_cache: Vec<u16>,
+    resource_discovered_cache: Vec<bool>,
+    cached_initial_total: u64,
     tick: u64,
     done: bool,
 }
@@ -95,6 +101,7 @@ impl App {
         drop(position_tx);
 
         let initial_remaining: u64 = sim_world_clone.resources().iter().map(|n| u64::from(n.quantity)).sum();
+        let stock_count = sim_world_clone.resources().len();
 
         Ok(Self {
             sim, sim_world: sim_world_clone, occupancy: occupancy.clone(), visual_theme,
@@ -106,6 +113,11 @@ impl App {
             cached_energy: 0,
             cached_crystals: 0,
             cached_remaining: initial_remaining,
+            stock_at_cache: vec![None; cell_count],
+            stock_remaining_cache: vec![0; stock_count],
+            stock_initial_cache: vec![0; stock_count],
+            resource_discovered_cache: vec![false; stock_count],
+            cached_initial_total: initial_remaining,
             tick: 0, done: false,
         })
     }
@@ -116,6 +128,11 @@ impl App {
         stdout.execute(EnterAlternateScreen)?;
         let backend = ratatui::backend::CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+
+        // Discard keys still buffered from launching (e.g. Enter after `cargo run`).
+        while event::poll(Duration::from_millis(0))? {
+            let _ = event::read()?;
+        }
 
         while !self.done {
             // Prepare occupancy grid for this tick.
@@ -129,11 +146,13 @@ impl App {
 
             self.barrier.wait().await;
 
-            // Clear old robot positions from bitmap.
-            let old_scout: Vec<Position> = self.scout_positions.to_vec();
-            let old_collector: Vec<Position> = self.collector_positions.to_vec();
-            for p in &old_scout { self.set_robot_at(*p, None); }
-            for p in &old_collector { self.set_robot_at(*p, None); }
+            // Clear old robot positions from bitmap — index-based, no alloc.
+            for i in 0..self.scout_positions.len() {
+                self.set_robot_at(self.scout_positions[i], None);
+            }
+            for i in 0..self.collector_positions.len() {
+                self.set_robot_at(self.collector_positions[i], None);
+            }
 
             while let Ok((id, pos)) = self.position_rx.try_recv() {
                 if id < NUM_SCOUTS {
@@ -146,11 +165,13 @@ impl App {
                 }
             }
 
-            // Rebuild bitmap from updated positions.
-            let new_scout: Vec<Position> = self.scout_positions.to_vec();
-            let new_collector: Vec<Position> = self.collector_positions.to_vec();
-            for p in &new_scout { self.set_robot_at(*p, Some(RobotKind::Scout)); }
-            for p in &new_collector { self.set_robot_at(*p, Some(RobotKind::Collector)); }
+            // Rebuild bitmap from updated positions — index-based, no alloc.
+            for i in 0..self.scout_positions.len() {
+                self.set_robot_at(self.scout_positions[i], Some(RobotKind::Scout));
+            }
+            for i in 0..self.collector_positions.len() {
+                self.set_robot_at(self.collector_positions[i], Some(RobotKind::Collector));
+            }
 
             {
                 let mut sim_guard = self.sim.write().await;
@@ -173,16 +194,22 @@ impl App {
                 self.cached_energy = sim_guard.base_inventory.energy;
                 self.cached_crystals = sim_guard.base_inventory.crystals;
                 self.cached_remaining = sim_guard.total_remaining();
+
+                // Snapshot resource stock data so rendering never needs the lock.
+                self.stock_at_cache.copy_from_slice(&sim_guard.stock_at);
+                for (i, stock) in sim_guard.stocks.iter().enumerate() {
+                    self.stock_remaining_cache[i] = stock.remaining;
+                    self.stock_initial_cache[i] = stock.initial;
+                    self.resource_discovered_cache[i] = sim_guard.resource_discovered[i];
+                }
             }
 
             self.tick += 1;
             terminal.draw(|f| self.render(f))?;
 
             if event::poll(FRAME_DURATION)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
-                        self.done = true;
-                    }
+                if is_quit_key(&event::read()?) {
+                    self.done = true;
                 }
             }
 
@@ -191,10 +218,8 @@ impl App {
                     terminal.draw(|f| self.render(f))?;
                     loop {
                         if event::poll(Duration::from_millis(100))? {
-                            if let Event::Key(key) = event::read()? {
-                                if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
-                                    break;
-                                }
+                            if is_quit_key(&event::read()?) {
+                                break;
                             }
                         }
                     }
@@ -210,7 +235,7 @@ impl App {
 
     fn render(&self, f: &mut Frame) {
         let area = f.area();
-        let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(area);
+        let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(6)]).split(area);
         self.render_map(f, layout[0]);
         self.render_status(f, layout[1]);
     }
@@ -237,8 +262,8 @@ impl App {
 
     fn cell_char(&self, pos: Position) -> (&str, Color) {
         let t = &self.visual_theme;
-        // O(1) bitmap lookup instead of Vec::contains scan.
         let idx = pos.y * self.sim_world.width() + pos.x;
+        // O(1) bitmap lookup instead of Vec::contains scan.
         match self.robot_at.get(idx).copied().flatten() {
             Some(RobotKind::Scout) => return (t.scout_char, t.scout_color),
             Some(RobotKind::Collector) => return (t.collector_char, t.collector_color),
@@ -247,7 +272,6 @@ impl App {
         if pos == self.sim_world.base() {
             return (t.base_char, self.base_pulse_color(t.base_color));
         }
-        let idx = pos.y * self.sim_world.width() + pos.x;
         let revealed = self.revealed_cache.get(idx).copied().unwrap_or(false);
         if !revealed {
             return self.fog_display(pos, t);
@@ -255,20 +279,35 @@ impl App {
         if self.sim_world.cell(pos) == Some(Cell::Obstacle) {
             return (t.obstacle_char(pos), t.obstacle_color_for(pos));
         }
-        if let Ok(sim_guard) = self.sim.try_read()
-            && sim_guard.is_resource_discovered(pos) && let Some(resource) = self.sim_world.resource_at(pos) {
-                let (remaining, initial) = sim_guard.stock_info_at(pos);
-                if remaining > 0 {
-                    let (ch, base_color) = t.resource_display(resource.kind);
-                    return (ch, glow_color(base_color, remaining as f64 / (initial as f64).max(1.0)));
-                }
+        // Use cached stock data — no lock needed, zero flicker.
+        if let Some(stock_idx) = self.stock_at_cache.get(idx).copied().flatten()
+            && stock_idx < self.resource_discovered_cache.len()
+            && self.resource_discovered_cache[stock_idx]
+            && stock_idx < self.stock_remaining_cache.len()
+        {
+            let remaining = self.stock_remaining_cache[stock_idx];
+            if remaining > 0 {
+                let initial = self.stock_initial_cache[stock_idx];
+                let ratio = remaining as f64 / (initial as f64).max(1.0);
+                let resource = &self.sim_world.resources()[stock_idx];
+                let (ch, base_color) = t.resource_display(resource.kind);
+                return (ch, self.resource_pulse_color(base_color, ratio));
             }
+        }
         (t.ground_char, t.ground_color)
     }
 
     fn base_pulse_color(&self, base: Color) -> Color {
         let phase = (self.tick % 30) as f64 / 30.0;
         fade_color(base, 0.75 + 0.25 * (phase * std::f64::consts::TAU).sin())
+    }
+
+    /// Smooth pulse + depletion fade for resources, like the base glow.
+    fn resource_pulse_color(&self, base_color: Color, ratio: f64) -> Color {
+        let phase = (self.tick % 30) as f64 / 30.0;
+        let pulse = 0.80 + 0.20 * (phase * std::f64::consts::TAU).sin();
+        let depleted = glow_color(base_color, ratio);
+        fade_color(depleted, pulse)
     }
 
     fn fog_display(&self, pos: Position, t: &VisualTheme) -> (&str, Color) {
@@ -293,13 +332,130 @@ impl App {
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
+        let t = &self.visual_theme;
         let done = self.cached_remaining == 0;
-        let text = if done {
-            format!("T:{}  E:{}  C:{}  Left:0  —  DONE!  Press any key", self.tick, self.cached_energy, self.cached_crystals)
+        let initial = self.cached_initial_total.max(1);
+        let progress = if done {
+            1.0
         } else {
-            format!("T:{}  E:{}  C:{}  Left:{}  —  running…", self.tick, self.cached_energy, self.cached_crystals, self.cached_remaining)
+            (initial - self.cached_remaining) as f64 / initial as f64
         };
-        f.render_widget(Paragraph::new(Span::styled(text, Style::default())), area);
+        let pct = (progress * 100.0).round() as u16;
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if done {
+                Color::LightGreen
+            } else {
+                Color::DarkGray
+            }))
+            .title(if done {
+                Line::from(Span::styled(
+                    " ✓ Mission complete ",
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(Span::styled(
+                    " Resource Collection ",
+                    Style::default().fg(Color::Cyan),
+                ))
+            });
+
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+        let row1 = Line::from(vec![
+            Span::styled("Tick ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<6}", self.tick),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  │  "),
+            Span::styled(
+                format!("{} Scouts", NUM_SCOUTS),
+                Style::default().fg(t.scout_color),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} Collectors", NUM_COLLECTORS),
+                Style::default().fg(t.collector_color),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(row1), rows[0]);
+
+        let row2 = Line::from(vec![
+            Span::styled(
+                format!(" {} ", t.energy_char),
+                Style::default().fg(t.energy_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Energy ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<6}", self.cached_energy),
+                Style::default().fg(t.energy_color),
+            ),
+            Span::raw("  │  "),
+            Span::styled(
+                format!(" {} ", t.crystal_char),
+                Style::default()
+                    .fg(t.crystal_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("Crystals ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:<6}", self.cached_crystals),
+                Style::default().fg(t.crystal_color),
+            ),
+            Span::raw("  │  "),
+            Span::styled("Left ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", self.cached_remaining),
+                Style::default().fg(if done { Color::LightGreen } else { Color::Yellow }),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(row2), rows[1]);
+
+        let gauge_color = if done { Color::LightGreen } else { Color::Green };
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(gauge_color).bg(Color::DarkGray))
+            .ratio(progress.min(1.0))
+            .label(format!("{pct}% collected"));
+        f.render_widget(gauge, rows[2]);
+
+        let hint = if done {
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Q",
+                    Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to exit", Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("● ", Style::default().fg(Color::Green)),
+                Span::styled("Running", Style::default().fg(Color::White)),
+                Span::styled("  —  press ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Q",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to quit", Style::default().fg(Color::DarkGray)),
+            ])
+        };
+        f.render_widget(
+            Paragraph::new(hint).alignment(Alignment::Center),
+            rows[3],
+        );
     }
 
     #[inline]
@@ -309,6 +465,13 @@ impl App {
             self.robot_at[idx] = kind;
         }
     }
+}
+
+fn is_quit_key(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key) if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q')
+    )
 }
 
 fn fade_color(c: Color, factor: f64) -> Color {

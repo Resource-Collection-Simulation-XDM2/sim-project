@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -66,12 +67,46 @@ pub struct Collector {
     // Per-collector RNG so target selection is not deterministic across
     // collectors — prevents every collector clustering on the same resource.
     rng: StdRng,
-    // Reusable BFS scratch — allocated once, reset before each plan.
-    // bfs_prev needs no fill() reset: stale values are never read because
+    // Reusable A* scratch — allocated once, reset before each plan.
+    // prev needs no fill() reset: stale values are never read because
     // we only follow prev[x] for cells marked visited in the current run.
-    bfs_visited: Vec<bool>,
-    bfs_prev: Vec<usize>,
+    astar_visited: Vec<bool>,
+    astar_prev: Vec<usize>,
+    astar_g: Vec<usize>,
 }
+
+// ---------------------------------------------------------------------------
+// A* pathfinding helpers
+// ---------------------------------------------------------------------------
+
+/// Node in the A* open-set priority queue.
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct AStarNode {
+    f_cost: usize,  // g (cost from start) + h (heuristic to goal)
+    index: usize,   // flat cell index
+}
+
+impl Ord for AStarNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is max-heap; reverse for min-heap behaviour.
+        other.f_cost.cmp(&self.f_cost)
+    }
+}
+
+impl PartialOrd for AStarNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Manhattan distance heuristic (admissible for 4-directional grid movement).
+fn manhattan(x1: usize, y1: usize, x2: usize, y2: usize) -> usize {
+    x1.abs_diff(x2) + y1.abs_diff(y2)
+}
+
+// ---------------------------------------------------------------------------
+// Collector
+// ---------------------------------------------------------------------------
 
 impl Collector {
     pub fn new(
@@ -95,8 +130,9 @@ impl Collector {
             stats: CollectorStats::default(),
             tx,
             rng: StdRng::seed_from_u64(u64::from(id).wrapping_mul(0x9E3779B97F4A7C15)),
-            bfs_visited: vec![false; map_size],
-            bfs_prev: vec![0_usize; map_size],
+            astar_visited: vec![false; map_size],
+            astar_prev: vec![0_usize; map_size],
+            astar_g: vec![0_usize; map_size],
         }
     }
 
@@ -252,7 +288,7 @@ impl Collector {
         }
     }
 
-    /// BFS pathfinding using reusable scratch buffers.
+    /// A* pathfinding using reusable scratch buffers.
     /// Writes the path directly into `self.path`; resets `self.path_next` to 0.
     /// Returns true if the goal is reachable. On failure `self.path` is empty.
     fn plan_path(&mut self, world: &World, start: Position, goal: Position) -> bool {
@@ -267,78 +303,98 @@ impl Collector {
         let height = world.height();
         let start_i = start.y * width + start.x;
         let goal_i = goal.y * width + goal.x;
+        let goal_x = goal.x;
+        let goal_y = goal.y;
 
-        // Reset visited flags only — prev needs no reset (explained on struct).
-        self.bfs_visited.fill(false);
+        // Reset visited + g-cost for this search.
+        self.astar_visited.fill(false);
 
-        let mut queue = VecDeque::with_capacity(64);
-        self.bfs_visited[start_i] = true;
-        queue.push_back(start_i);
+        let mut open = BinaryHeap::with_capacity(64);
+        self.astar_g[start_i] = 0;
+        self.astar_visited[start_i] = true;
+        open.push(AStarNode {
+            f_cost: manhattan(start.x, start.y, goal_x, goal_y),
+            index: start_i,
+        });
 
-        'bfs: while let Some(cur) = queue.pop_front() {
+        while let Some(AStarNode { index: cur, .. }) = open.pop() {
             if cur == goal_i {
-                break 'bfs;
+                // Reconstruct path.
+                let mut cursor = goal_i;
+                while cursor != start_i {
+                    self.path.push(Position {
+                        x: cursor % width,
+                        y: cursor / width,
+                    });
+                    cursor = self.astar_prev[cursor];
+                }
+                self.path.reverse();
+                return true;
             }
+
             let x = cur % width;
             let y = cur / width;
+            let next_g = self.astar_g[cur] + 1;
 
             if y > 0 {
                 let next = (y - 1) * width + x;
-                if !self.bfs_visited[next]
+                if !self.astar_visited[next]
                     && world.cell(Position { x, y: y - 1 }) == Some(Cell::Walkable)
                 {
-                    self.bfs_visited[next] = true;
-                    self.bfs_prev[next] = cur;
-                    queue.push_back(next);
+                    self.astar_visited[next] = true;
+                    self.astar_prev[next] = cur;
+                    self.astar_g[next] = next_g;
+                    open.push(AStarNode {
+                        f_cost: next_g + manhattan(x, y - 1, goal_x, goal_y),
+                        index: next,
+                    });
                 }
             }
             if x + 1 < width {
                 let next = y * width + (x + 1);
-                if !self.bfs_visited[next]
+                if !self.astar_visited[next]
                     && world.cell(Position { x: x + 1, y }) == Some(Cell::Walkable)
                 {
-                    self.bfs_visited[next] = true;
-                    self.bfs_prev[next] = cur;
-                    queue.push_back(next);
+                    self.astar_visited[next] = true;
+                    self.astar_prev[next] = cur;
+                    self.astar_g[next] = next_g;
+                    open.push(AStarNode {
+                        f_cost: next_g + manhattan(x + 1, y, goal_x, goal_y),
+                        index: next,
+                    });
                 }
             }
             if y + 1 < height {
                 let next = (y + 1) * width + x;
-                if !self.bfs_visited[next]
+                if !self.astar_visited[next]
                     && world.cell(Position { x, y: y + 1 }) == Some(Cell::Walkable)
                 {
-                    self.bfs_visited[next] = true;
-                    self.bfs_prev[next] = cur;
-                    queue.push_back(next);
+                    self.astar_visited[next] = true;
+                    self.astar_prev[next] = cur;
+                    self.astar_g[next] = next_g;
+                    open.push(AStarNode {
+                        f_cost: next_g + manhattan(x, y + 1, goal_x, goal_y),
+                        index: next,
+                    });
                 }
             }
             if x > 0 {
                 let next = y * width + (x - 1);
-                if !self.bfs_visited[next]
+                if !self.astar_visited[next]
                     && world.cell(Position { x: x - 1, y }) == Some(Cell::Walkable)
                 {
-                    self.bfs_visited[next] = true;
-                    self.bfs_prev[next] = cur;
-                    queue.push_back(next);
+                    self.astar_visited[next] = true;
+                    self.astar_prev[next] = cur;
+                    self.astar_g[next] = next_g;
+                    open.push(AStarNode {
+                        f_cost: next_g + manhattan(x - 1, y, goal_x, goal_y),
+                        index: next,
+                    });
                 }
             }
         }
 
-        if !self.bfs_visited[goal_i] {
-            return false;
-        }
-
-        // Reconstruct path directly into self.path — no intermediate Vec.
-        let mut cursor = goal_i;
-        while cursor != start_i {
-            self.path.push(Position {
-                x: cursor % width,
-                y: cursor / width,
-            });
-            cursor = self.bfs_prev[cursor];
-        }
-        self.path.reverse();
-        true
+        false // no path
     }
 
     /// Pick a resource target using Manhattan-distance-biased randomness.
