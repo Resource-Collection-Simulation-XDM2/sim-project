@@ -8,7 +8,7 @@ use crossterm::ExecutableCommand;
 use ratatui::Terminal;
 use tokio::sync::{mpsc, Barrier, RwLock};
 
-use crate::collision::OccupancyGrid;
+use crate::occupancy::OccupancyGrid;
 use crate::collector::{Collector, CollectorConfig, CollectorMessage};
 use crate::concurrency::{self, SharedOcc, SharedSim};
 use crate::map::{MapPreset, VisualTheme};
@@ -227,10 +227,10 @@ impl App {
             let snapshot = self.snapshot();
             terminal.draw(|f| ui::render(f, &snapshot))?;
 
-            if event::poll(FRAME_DURATION)? {
-                if is_quit_key(&event::read()?) {
-                    self.done = true;
-                }
+            if event::poll(FRAME_DURATION)?
+                && is_quit_key(&event::read()?)
+            {
+                self.done = true;
             }
 
             {
@@ -238,10 +238,10 @@ impl App {
                     let snapshot = self.snapshot();
                     terminal.draw(|f| ui::render(f, &snapshot))?;
                     loop {
-                        if event::poll(Duration::from_millis(100))? {
-                            if is_quit_key(&event::read()?) {
-                                break;
-                            }
+                        if event::poll(Duration::from_millis(100))?
+                            && is_quit_key(&event::read()?)
+                        {
+                            break;
                         }
                     }
                     self.done = true;

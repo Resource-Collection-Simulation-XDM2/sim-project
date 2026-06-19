@@ -1,5 +1,5 @@
 pub mod app;
-pub mod collision;
+pub mod occupancy;
 pub mod collector;
 pub mod concurrency;
 pub mod map;

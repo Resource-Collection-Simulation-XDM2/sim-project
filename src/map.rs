@@ -191,7 +191,8 @@ impl VisualTheme {
     /// a narrower preset like `cavern` with a smaller font.
     pub const EMOJI: Self = Self {
         name: "emoji",
-        obstacle_palette: &["🪨", "🌳", "💧"],
+        obstacle_palette: &["🪨"],
+        // obstacle_palette: &["🪨", "🌳", "💧"],
         energy_char: "⚡",
         crystal_char: "💎",
         base_char: "🏠",
