@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -115,10 +115,12 @@ impl App {
 
             // Non-blocking input poll.
             if event::poll(FRAME_DURATION)?
-                && let Event::Key(_) = event::read()?
+                && let Event::Key(key) = event::read()?
             {
-                // Any key press exits, per project spec.
-                self.done = true;
+                // Exit only on explicit keys to avoid instant close on launch.
+                if matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc) {
+                    self.done = true;
+                }
             }
 
             self.tick_simulation();
@@ -331,7 +333,7 @@ impl App {
             )
         } else {
             format!(
-                "T:{}  E:{}  C:{}  Left:{}  —  running…",
+                "T:{}  E:{}  C:{}  Left:{}  —  running…  (q/Esc to quit)",
                 self.tick, inv.energy, inv.crystals, remaining
             )
         };
