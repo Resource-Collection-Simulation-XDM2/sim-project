@@ -161,6 +161,14 @@ impl Simulation {
             .map(|(_, stock)| stock.position)
     }
 
+    pub fn discovered_resource_count(&self) -> usize {
+        self.resource_discovered.iter().filter(|&&d| d).count()
+    }
+
+    pub fn revealed_cell_count(&self) -> usize {
+        self.cells_revealed.iter().filter(|&&r| r).count()
+    }
+
     // ------------------------------------------------------------------
     // Fog-of-war / discovery
     // ------------------------------------------------------------------
