@@ -21,6 +21,8 @@ pub enum MapPreset {
     Archipelago,
     /// Wide-open terrain with only sparse rocks.
     Plains,
+    /// Small open map for fast integration tests.
+    Compact,
 }
 
 impl MapPreset {
@@ -49,6 +51,16 @@ impl MapPreset {
                 obstacle_frequency: 0.05,
                 ..base
             },
+            Self::Compact => WorldConfig {
+                width: 32,
+                height: 20,
+                energy_nodes: 4,
+                crystal_nodes: 4,
+                obstacle_threshold: 0.35,
+                obstacle_frequency: 0.05,
+                base_safety_radius: 3,
+                ..base
+            },
         }
     }
 }
@@ -63,8 +75,9 @@ impl FromStr for MapPreset {
             "forest" | "f" => Ok(Self::Forest),
             "archipelago" | "archi" | "a" => Ok(Self::Archipelago),
             "plains" | "open" | "p" => Ok(Self::Plains),
+            "compact" | "small" => Ok(Self::Compact),
             other => Err(format!(
-                "unknown preset '{other}'. try: default, cavern, forest, archipelago, plains"
+                "unknown preset '{other}'. try: default, cavern, forest, archipelago, plains, compact"
             )),
         }
     }

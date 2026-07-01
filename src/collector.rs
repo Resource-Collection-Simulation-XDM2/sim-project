@@ -262,22 +262,36 @@ impl Collector {
             return;
         }
 
-        if let Some(kind) = self.cargo_kind {
-            // Send unload message to base — asynchronous, non-blocking.
-            let msg = CollectorMessage {
-                collector_id: self.id,
-                kind,
-                amount: self.cargo,
-            };
-            let _ = self.tx.try_send(msg);
-            self.stats.unloaded_units += u64::from(self.cargo);
-        }
+        let Some(kind) = self.cargo_kind else {
+            self.cargo = 0;
+            self.state = CollectorState::Seeking;
+            return;
+        };
 
-        self.cargo = 0;
-        self.cargo_kind = None;
-        self.state = CollectorState::Seeking;
-        self.path.clear();
-        self.path_next = 0;
+        let msg = CollectorMessage {
+            collector_id: self.id,
+            kind,
+            amount: self.cargo,
+        };
+
+        match self.tx.try_send(msg) {
+            Ok(()) => {
+                self.stats.unloaded_units += u64::from(self.cargo);
+                self.cargo = 0;
+                self.cargo_kind = None;
+                self.state = CollectorState::Seeking;
+                self.path.clear();
+                self.path_next = 0;
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Channel saturated — keep cargo and retry next tick.
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.cargo = 0;
+                self.cargo_kind = None;
+                self.state = CollectorState::Idle;
+            }
+        }
     }
 
     fn step_along_path(&mut self) {

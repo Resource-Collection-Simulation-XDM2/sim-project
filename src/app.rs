@@ -22,6 +22,28 @@ const NUM_COLLECTORS: u16 = 3;
 const CHANNEL_CAPACITY: usize = 128;
 const FRAME_DURATION: Duration = Duration::from_millis(33);
 
+/// Read-only simulation metrics for tests and diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimMetrics {
+    pub tick: u64,
+    pub energy: u64,
+    pub crystals: u64,
+    pub remaining: u64,
+    pub initial_total: u64,
+    pub revealed_cells: usize,
+    pub discovered_resources: usize,
+}
+
+impl SimMetrics {
+    pub fn collected(&self) -> u64 {
+        self.energy + self.crystals
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
 /// Which type of robot occupies a cell (for O(1) rendering lookup).
 #[derive(Clone, Copy)]
 pub(crate) enum RobotKind {
@@ -141,6 +163,101 @@ impl App {
         })
     }
 
+    pub fn world(&self) -> &World {
+        &self.sim_world
+    }
+
+    pub fn scout_positions(&self) -> &[Position] {
+        &self.scout_positions
+    }
+
+    pub fn collector_positions(&self) -> &[Position] {
+        &self.collector_positions
+    }
+
+    pub fn metrics(&self) -> SimMetrics {
+        SimMetrics {
+            tick: self.tick,
+            energy: self.cached_energy,
+            crystals: self.cached_crystals,
+            remaining: self.cached_remaining,
+            initial_total: self.cached_initial_total,
+            revealed_cells: self.revealed_cache.iter().filter(|&&r| r).count(),
+            discovered_resources: self.resource_discovered_cache.iter().filter(|&&d| d).count(),
+        }
+    }
+
+    /// Advance one simulation tick without terminal rendering or input.
+    pub async fn step(&mut self) {
+        {
+            let mut occ = self.occupancy.write().await;
+            occ.clear();
+            for pos in self.scout_positions.iter().chain(&self.collector_positions) {
+                occ.try_reserve(*pos);
+            }
+        }
+
+        self.barrier.wait().await;
+
+        for i in 0..self.scout_positions.len() {
+            self.set_robot_at(self.scout_positions[i], None);
+        }
+        for i in 0..self.collector_positions.len() {
+            self.set_robot_at(self.collector_positions[i], None);
+        }
+
+        while let Ok((id, pos)) = self.position_rx.try_recv() {
+            if id < NUM_SCOUTS {
+                self.scout_positions[id as usize] = pos;
+            } else {
+                let cid = id - NUM_SCOUTS;
+                if (cid as usize) < self.collector_positions.len() {
+                    self.collector_positions[cid as usize] = pos;
+                }
+            }
+        }
+
+        for i in 0..self.scout_positions.len() {
+            self.set_robot_at(self.scout_positions[i], Some(RobotKind::Scout));
+        }
+        for i in 0..self.collector_positions.len() {
+            self.set_robot_at(self.collector_positions[i], Some(RobotKind::Collector));
+        }
+
+        {
+            let mut sim_guard = self.sim.write().await;
+            while let Ok(msg) = self.scout_rx.try_recv() {
+                for d in &msg.discoveries {
+                    match d {
+                        Discovery::Resource { position, .. } => {
+                            sim_guard.mark_resource_discovered(*position)
+                        }
+                        Discovery::Obstacle { position } => sim_guard.mark_obstacle_discovered(*position),
+                    }
+                }
+            }
+            while let Ok(msg) = self.collector_rx.try_recv() {
+                sim_guard.unload(msg.kind, msg.amount);
+            }
+            for pos in self.scout_positions.iter().chain(&self.collector_positions) {
+                sim_guard.reveal_cell(*pos);
+            }
+
+            self.revealed_cache.copy_from_slice(sim_guard.revealed_bitmap());
+            self.cached_energy = sim_guard.base_inventory.energy;
+            self.cached_crystals = sim_guard.base_inventory.crystals;
+            self.cached_remaining = sim_guard.total_remaining();
+            self.stock_at_cache.copy_from_slice(&sim_guard.stock_at);
+            for (i, stock) in sim_guard.stocks.iter().enumerate() {
+                self.stock_remaining_cache[i] = stock.remaining;
+                self.stock_initial_cache[i] = stock.initial;
+                self.resource_discovered_cache[i] = sim_guard.resource_discovered[i];
+            }
+        }
+
+        self.tick += 1;
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         let mut stdout = std::io::stdout();
         terminal::enable_raw_mode()?;
@@ -154,76 +271,8 @@ impl App {
         }
 
         while !self.done {
-            // Prepare occupancy grid for this tick.
-            {
-                let mut occ = self.occupancy.write().await;
-                occ.clear();
-                for pos in self.scout_positions.iter().chain(&self.collector_positions) {
-                    occ.try_reserve(*pos);
-                }
-            }
+            self.step().await;
 
-            self.barrier.wait().await;
-
-            // Clear old robot positions from bitmap — index-based, no alloc.
-            for i in 0..self.scout_positions.len() {
-                self.set_robot_at(self.scout_positions[i], None);
-            }
-            for i in 0..self.collector_positions.len() {
-                self.set_robot_at(self.collector_positions[i], None);
-            }
-
-            while let Ok((id, pos)) = self.position_rx.try_recv() {
-                if id < NUM_SCOUTS {
-                    self.scout_positions[id as usize] = pos;
-                } else {
-                    let cid = id - NUM_SCOUTS;
-                    if (cid as usize) < self.collector_positions.len() {
-                        self.collector_positions[cid as usize] = pos;
-                    }
-                }
-            }
-
-            // Rebuild bitmap from updated positions — index-based, no alloc.
-            for i in 0..self.scout_positions.len() {
-                self.set_robot_at(self.scout_positions[i], Some(RobotKind::Scout));
-            }
-            for i in 0..self.collector_positions.len() {
-                self.set_robot_at(self.collector_positions[i], Some(RobotKind::Collector));
-            }
-
-            {
-                let mut sim_guard = self.sim.write().await;
-                while let Ok(msg) = self.scout_rx.try_recv() {
-                    for d in &msg.discoveries {
-                        match d {
-                            Discovery::Resource { position, .. } => sim_guard.mark_resource_discovered(*position),
-                            Discovery::Obstacle { position } => sim_guard.mark_obstacle_discovered(*position),
-                        }
-                    }
-                }
-                while let Ok(msg) = self.collector_rx.try_recv() {
-                    sim_guard.unload(msg.kind, msg.amount);
-                }
-                for pos in self.scout_positions.iter().chain(&self.collector_positions) {
-                    sim_guard.reveal_cell(*pos);
-                }
-                // Snapshot state for flicker-free rendering.
-                self.revealed_cache.copy_from_slice(sim_guard.revealed_bitmap());
-                self.cached_energy = sim_guard.base_inventory.energy;
-                self.cached_crystals = sim_guard.base_inventory.crystals;
-                self.cached_remaining = sim_guard.total_remaining();
-
-                // Snapshot resource stock data so rendering never needs the lock.
-                self.stock_at_cache.copy_from_slice(&sim_guard.stock_at);
-                for (i, stock) in sim_guard.stocks.iter().enumerate() {
-                    self.stock_remaining_cache[i] = stock.remaining;
-                    self.stock_initial_cache[i] = stock.initial;
-                    self.resource_discovered_cache[i] = sim_guard.resource_discovered[i];
-                }
-            }
-
-            self.tick += 1;
             let snapshot = self.snapshot();
             terminal.draw(|f| ui::render(f, &snapshot))?;
 
@@ -300,20 +349,16 @@ mod tests {
         let mut app = App::new(42, MapPreset::Default, VisualTheme::DEFAULT, RevealMode::Normal).await
             .expect("app create");
         for _ in 0..200 {
-            app.barrier.wait().await;
-            while app.position_rx.try_recv().is_ok() {}
-            while app.scout_rx.try_recv().is_ok() {}
-            while app.collector_rx.try_recv().is_ok() {}
-            app.tick += 1;
+            app.step().await;
         }
-        assert!(app.tick > 0);
+        assert!(app.metrics().tick > 0);
     }
 
     #[tokio::test]
     async fn app_creates_expected_number_of_robots() {
         let app = App::new(99, MapPreset::Default, VisualTheme::DEFAULT, RevealMode::Normal).await
             .expect("app create");
-        assert_eq!(app.scout_positions.len(), NUM_SCOUTS as usize);
-        assert_eq!(app.collector_positions.len(), NUM_COLLECTORS as usize);
+        assert_eq!(app.scout_positions().len(), NUM_SCOUTS as usize);
+        assert_eq!(app.collector_positions().len(), NUM_COLLECTORS as usize);
     }
 }
