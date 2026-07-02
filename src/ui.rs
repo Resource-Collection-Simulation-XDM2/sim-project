@@ -56,7 +56,8 @@ fn cell_char<'a>(snapshot: &'a AppSnapshot<'a>, pos: Position) -> (&'a str, Colo
     }
 
     if snapshot.sim_world.cell(pos) == Some(Cell::Obstacle) {
-        return (t.obstacle_char(pos), t.obstacle_color_for(pos));
+        let biome = snapshot.sim_world.obstacle_biome(pos).unwrap_or(0);
+        return (t.obstacle_char(biome), t.obstacle_color_for(biome));
     }
 
     if let Some(stock_idx) = snapshot.stock_at_cache.get(idx).copied().flatten()
