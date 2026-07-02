@@ -29,11 +29,18 @@ pub enum Cell {
     Obstacle,
 }
 
+/// Maps a biome noise value (0..=255) to a palette entry for obstacle variety.
+/// Low values → water/wet, mid values → forest/vegetation, high values → rock/mountain.
+pub type BiomeId = u8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct World {
     width: usize,
     height: usize,
     cells: Vec<Cell>,
+    /// Per-cell biome identifier for obstacle cells. `0` for walkable cells
+    /// (but the value is only meaningful when `cells[idx] == Cell::Obstacle`).
+    obstacle_biome: Vec<BiomeId>,
     resource_at: Vec<Option<usize>>,
     resources: Vec<ResourceNode>,
     base: Position,
@@ -96,6 +103,7 @@ impl World {
         let mut rng = StdRng::seed_from_u64(seed);
         let perlin = Perlin::new(seed as u32);
         let mut cells = vec![Cell::Walkable; config.width * config.height];
+        let mut obstacle_biome = vec![0u8; config.width * config.height];
         let mut resource_at = vec![None; config.width * config.height];
         let mut resources = Vec::with_capacity(config.energy_nodes + config.crystal_nodes);
         let base = Position {
@@ -115,6 +123,12 @@ impl World {
                 );
                 if sample > config.obstacle_threshold {
                     cells[idx] = Cell::Obstacle;
+                    // Secondary low-frequency noise for biome classification.
+                    // Single octave at very low frequency produces large coherent patches
+                    // that look like natural terrain (lakes, forests, mountains).
+                    let biome_noise = perlin.get([x as f64 * 0.015, y as f64 * 0.015]);
+                    // Map [-1, 1] → [0, 255]
+                    obstacle_biome[idx] = ((biome_noise + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
                 }
             }
         }
@@ -181,6 +195,7 @@ impl World {
             width: config.width,
             height: config.height,
             cells,
+            obstacle_biome,
             resource_at,
             resources,
             base,
@@ -210,6 +225,17 @@ impl World {
     pub fn resource_at(&self, position: Position) -> Option<&ResourceNode> {
         let idx = self.index(position)?;
         self.resource_at[idx].and_then(|resource_idx| self.resources.get(resource_idx))
+    }
+
+    /// Return the biome identifier for the obstacle at `position`, or `None`
+    /// if the cell is not an obstacle.
+    pub fn obstacle_biome(&self, position: Position) -> Option<BiomeId> {
+        let idx = self.index(position)?;
+        if self.cells[idx] == Cell::Obstacle {
+            Some(self.obstacle_biome[idx])
+        } else {
+            None
+        }
     }
 
     pub fn obstacle_count(&self) -> usize {

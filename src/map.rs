@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use ratatui::style::Color;
 
-use crate::world::{Position, ResourceKind, WorldConfig};
+use crate::world::{BiomeId, ResourceKind, WorldConfig};
 
 // ---------------------------------------------------------------------------
 // Generation presets — control how the world is generated
@@ -59,7 +59,6 @@ impl MapPreset {
                 obstacle_threshold: 0.35,
                 obstacle_frequency: 0.05,
                 base_safety_radius: 3,
-                ..base
             },
         }
     }
@@ -89,8 +88,9 @@ impl FromStr for MapPreset {
 
 /// Controls the characters and colors used to render every element on the map.
 ///
-/// Obstacle characters are drawn from a palette (with position-based variety)
-/// so the same logical `Cell::Obstacle` can appear as different glyphs.
+/// Obstacle characters are drawn from a palette (with biome-based variety)
+/// so the same logical `Cell::Obstacle` can appear as different glyphs
+/// in coherent terrain patches (lakes, forests, mountains).
 #[derive(Debug, Clone)]
 pub struct VisualTheme {
     pub name: &'static str,
@@ -204,8 +204,7 @@ impl VisualTheme {
     /// a narrower preset like `cavern` with a smaller font.
     pub const EMOJI: Self = Self {
         name: "emoji",
-        obstacle_palette: &["🪨"],
-        // obstacle_palette: &["🪨", "🌳", "💧"],
+        obstacle_palette: &["🪨", "🌳", "💧"],
         energy_char: "⚡",
         crystal_char: "💎",
         base_char: "🏠",
@@ -225,24 +224,25 @@ impl VisualTheme {
         obstacle_color_palette: &[Color::Gray, Color::Green, Color::LightBlue],
     };
 
-    /// Pick an obstacle character based on position for terrain variety.
+    /// Pick an obstacle character based on biome identifier for terrain variety.
     ///
-    /// Uses a simple hash so the same cell always gets the same glyph within
-    /// a theme, giving the illusion of terrain types without extra storage.
-    pub fn obstacle_char(&self, pos: Position) -> &'static str {
+    /// The biome value (0..=255) maps to palette entries, producing coherent
+    /// terrain patches — low values for water/wet terrain, mid values for
+    /// vegetation/forest, high values for rock/mountain.
+    pub fn obstacle_char(&self, biome: BiomeId) -> &'static str {
         if self.obstacle_palette.is_empty() {
             return "O";
         }
-        let idx = (pos.x.wrapping_mul(7) ^ pos.y.wrapping_mul(13)) % self.obstacle_palette.len();
+        let idx = (biome as usize).wrapping_mul(self.obstacle_palette.len()) >> 8;
         self.obstacle_palette[idx]
     }
 
-    /// Biome-aware color for the obstacle at `pos`.
-    pub fn obstacle_color_for(&self, pos: Position) -> Color {
+    /// Biome-aware color for the obstacle at the given biome identifier.
+    pub fn obstacle_color_for(&self, biome: BiomeId) -> Color {
         if self.obstacle_color_palette.is_empty() {
             return self.obstacle_color;
         }
-        let idx = (pos.x.wrapping_mul(7) ^ pos.y.wrapping_mul(13)) % self.obstacle_color_palette.len();
+        let idx = (biome as usize).wrapping_mul(self.obstacle_color_palette.len()) >> 8;
         self.obstacle_color_palette[idx]
     }
 
