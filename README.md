@@ -17,7 +17,7 @@ cargo run -- forest emoji 42       # forest preset, emoji theme, seed 42
 cargo run -- archi symbols reveal  # archipelago, full map view (no fog)
 ```
 
-**Any key exits.** Press any key to quit the simulation.
+**Press `q` to exit.** The simulation runs until you press `q` or `Q`.
 
 ---
 
