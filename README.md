@@ -11,12 +11,10 @@ A real-time terminal-based simulation in Rust using Ratatui. Autonomous scout an
 ## Quick Start
 
 ```bash
-cargo run                                    # random map, default theme
-cargo run -- cavern retro                    # cavern preset, retro ASCII theme
-cargo run -- forest emoji 42                 # forest preset, emoji theme, seed 42 (reproducible map)
-cargo run -- archi symbols reveal            # archipelago, full map view (no fog)
-cargo run -- plains default nofog            # terrain visible, resources hidden
-cargo run -- default default 99 reveal       # seed 99, full reveal
+cargo run                          # random map, default theme
+cargo run -- cavern retro          # cavern preset, retro ASCII theme
+cargo run -- forest emoji 42       # forest preset, emoji theme, seed 42
+cargo run -- archi symbols reveal  # archipelago, full map view (no fog)
 ```
 
 **Any key exits.** Press any key to quit the simulation.
