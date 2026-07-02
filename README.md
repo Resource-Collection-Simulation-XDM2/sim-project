@@ -11,10 +11,12 @@ A real-time terminal-based simulation in Rust using Ratatui. Autonomous scout an
 ## Quick Start
 
 ```bash
-cargo run                          # random map, default theme
-cargo run -- cavern retro          # cavern preset, retro ASCII theme
-cargo run -- forest emoji 42       # forest preset, emoji theme, seed 42
-cargo run -- archi symbols reveal  # archipelago, full map view (no fog)
+cargo run                                    # random map, default theme
+cargo run -- cavern retro                    # cavern preset, retro ASCII theme
+cargo run -- forest emoji 42                 # forest preset, emoji theme, seed 42 (reproducible map)
+cargo run -- archi symbols reveal            # archipelago, full map view (no fog)
+cargo run -- plains default nofog            # terrain visible, resources hidden
+cargo run -- default default 99 reveal       # seed 99, full reveal
 ```
 
 **Any key exits.** Press any key to quit the simulation.
@@ -57,7 +59,11 @@ cargo run -- default default 99 reveal       # seed 99, full reveal
 | `archipelago` | ~60% | Large water bodies, narrow land bridges |
 | `plains` | ~12% | Wide-open terrain, sparse rocks |
 
-All maps use **3-octave fractal Perlin noise** for coherent, natural-looking obstacle clusters. A BFS flood-fill from the base ensures all placed resources are reachable.
+All maps use **3-octave fractal Perlin noise** for obstacle placement plus a
+**secondary low-frequency noise field** for coherent biome patches — obstacle
+glyphs cluster naturally into rock fields, forests, or water bodies instead of
+random scatter. A BFS flood-fill from the base ensures all placed resources are
+reachable.
 
 ---
 
@@ -70,7 +76,7 @@ All maps use **3-octave fractal Perlin noise** for coherent, natural-looking obs
 | `symbols` | `◆` `▲` `■` `●` | `⚡` | `♦` | `⌂` | `●` | `○` |
 | `emoji` | `🪨` `🌳` `💧` | `⚡` | `💎` | `🏠` | `🔍` | `🤖` |
 
-Visual effects: biome terrain colours, resource depletion glow, base pulse animation, gradient fog edges.
+Visual effects: biome terrain colors, resource depletion glow, base pulse animation, gradient fog edges.
 
 ---
 
@@ -97,20 +103,20 @@ Visual effects: biome terrain colours, resource depletion glow, base pulse anima
 
 ```
 Main Thread                 7 Robot Tasks (tokio::spawn)
-+--------------+            +--------------------------+
++--------------+            +---------------------------+
 | barrier.wait |<--Barrier--| barrier.wait              |
-| drain msgs   |            | sim.read() -> move         |
+| drain msgs   |            | sim.read() -> move        |
 | update sim   |            | collision::resolve()      |
 | render frame |            | position_tx.send()        |
 | poll input   |            | barrier.wait              |
-+--------------+            +--------------------------+
-        |                            |
-        +----------+-----------------+
-                   |
-     +-------------v-------------+
-     |  Arc<RwLock<Simulation>> |
-     |  Arc<RwLock<Occupancy>>  |
-     +---------------------------+
++--------------+            +---------------------------+
+        |                                |
+        +--------------+-----------------+
+                       |
+         +-------------v-------------+
+         |  Arc<RwLock<Simulation>>  |
+         |  Arc<RwLock<Occupancy>>   |
+         +---------------------------+
 ```
 
 | Component | Implementation |
@@ -136,7 +142,7 @@ src/
   scout.rs         Scout exploration, discovery batching, messaging
   collector.rs     A* pathfinding, state machine, collector messaging
   occupancy.rs     Occupancy grid, collision resolution, deadlock breaker
-  map.rs           Map presets, visual themes, biome colours
+  map.rs           Map presets, visual themes, biome colors
   ui.rs            Ratatui rendering — map, status bar, progress gauge
   app.rs           Event loop, simulation driver, AppSnapshot for UI
   concurrency.rs   Async robot task runners
