@@ -153,7 +153,7 @@ impl VisualTheme {
     /// Retro ASCII theme — uses uppercase letters only.
     pub const RETRO: Self = Self {
         name: "retro",
-        obstacle_palette: &["#", "%", "&", "@"],
+        obstacle_palette: &["#"],
         energy_char: "E",
         crystal_char: "C",
         base_char: "H",
@@ -176,7 +176,7 @@ impl VisualTheme {
     /// Single-width Unicode symbols — safe for any terminal, no grid shifting.
     pub const SYMBOLS: Self = Self {
         name: "symbols",
-        obstacle_palette: &["◆", "▲", "■", "●"],
+        obstacle_palette: &["■"],
         energy_char: "⚡",
         crystal_char: "♦",
         base_char: "⌂",
@@ -205,7 +205,6 @@ impl VisualTheme {
     pub const EMOJI: Self = Self {
         name: "emoji",
         obstacle_palette: &["🪨"],
-        // obstacle_palette: &["🪨", "🌳", "💧"],
         energy_char: "⚡",
         crystal_char: "💎",
         base_char: "🏠",
